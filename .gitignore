@@ -35,3 +35,7 @@ packages/
 # Benchmark results
 benchmark_results.txt
 *.json
+
+# Testing
+testing/
+

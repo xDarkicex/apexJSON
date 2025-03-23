@@ -83,8 +83,8 @@ func Marshal(v interface{}) ([]byte, error) {
 	}
 
 	// Create a copy of the buffer contents
-	result := make([]byte, len(buf.buf)-buf.off)
-	copy(result, buf.buf[buf.off:])
+	result := make([]byte, buf.off)
+	copy(result, buf.buf[:buf.off])
 	return result, nil
 }
 func Unmarshal(data []byte, v interface{}) error {

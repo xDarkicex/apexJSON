@@ -59,7 +59,8 @@ type Field struct {
 	nameWithQuotesBytes []byte // 24 bytes (ptr + len + cap)
 	index               []int  // 24 bytes (ptr + len + cap)
 	omitEmpty           bool   // 1 byte (padded to 8)
-	// 7 bytes padding here, could add future fields
+	stringOpt           bool   // 1 byte (padded to 8)
+	// 6 bytes padding here, could add future fields
 }
 
 // Buffer with largest field first

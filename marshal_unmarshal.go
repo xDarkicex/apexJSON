@@ -19,14 +19,23 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 		return nil
 	}
 
-	// 2. Direct kind handling for most common types - avoids Interface() calls
+	// 2. Handle pointer indirection with a loop to avoid recursion
+	// This ensures proper handling of pointers to all types including primitives
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			buf.Write(jsonNull)
+			return nil
+		}
+		v = v.Elem()
+	}
+
+	// 3. Direct kind handling for most common types - avoids Interface() calls
 	switch v.Kind() {
 	case reflect.String:
 		buf.WriteByte(jsonQuote)
 		writeEscapedStringString(buf, v.String()) // Use string-direct version
 		buf.WriteByte(jsonQuote)
 		return nil
-
 	case reflect.Bool:
 		if v.Bool() {
 			buf.Write(jsonTrue)
@@ -34,14 +43,12 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 			buf.Write(jsonFalse)
 		}
 		return nil
-
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		numBuf := getNumberBuf()
 		*numBuf = strconv.AppendInt((*numBuf)[:0], v.Int(), 10)
 		buf.Write(*numBuf)
 		putNumberBuf(numBuf)
 		return nil
-
 	case reflect.Float32, reflect.Float64:
 		f := v.Float()
 		if math.IsInf(f, 0) || math.IsNaN(f) {
@@ -52,9 +59,15 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 		buf.Write(*numBuf)
 		putNumberBuf(numBuf)
 		return nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		numBuf := getNumberBuf()
+		*numBuf = strconv.AppendUint((*numBuf)[:0], v.Uint(), 10)
+		buf.Write(*numBuf)
+		putNumberBuf(numBuf)
+		return nil
 	}
 
-	// 3. Only use Interface() for special types that need it
+	// 4. Only use Interface() for special types that need it
 	if v.CanInterface() {
 		switch x := v.Interface().(type) {
 		case time.Time:
@@ -67,7 +80,6 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 			buf.off += len(b)
 			buf.WriteByte(jsonQuote)
 			return nil
-
 		case Marshaler:
 			data, err := x.MarshalJSON()
 			if err != nil {
@@ -75,12 +87,11 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 			}
 			buf.Write(data)
 			return nil
-
 		case []byte:
 			buf.WriteByte(jsonQuote)
 			encodedLen := base64.StdEncoding.EncodedLen(len(x))
 			if encodedLen > 0 {
-				// Encode directly into buffer if possible, avoiding allocation
+				// Encode directly into buffer if possible
 				if buf.off+encodedLen <= cap(buf.buf) {
 					buf.grow(encodedLen)
 					base64.StdEncoding.Encode(buf.buf[buf.off:], x)
@@ -98,27 +109,24 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 		}
 	}
 
-	// 4. Handle interface and pointer indirection
+	// 5. Handle interface indirection
 	if v.Kind() == reflect.Interface && !v.IsNil() {
 		v = v.Elem()
-	}
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			buf.Write(jsonNull)
+
+		// If the interface contains a string, handle it directly
+		if v.Kind() == reflect.String {
+			buf.WriteByte(jsonQuote)
+			writeEscapedStringString(buf, v.String())
+			buf.WriteByte(jsonQuote)
 			return nil
 		}
-		v = v.Elem()
+
+		// For all other types, process the concrete value recursively
+		return marshalValue(v, buf)
 	}
 
-	// 5. Type-specific encoding for remaining types
+	// 6. Type-specific encoding for remaining types
 	switch v.Kind() {
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		numBuf := getNumberBuf()
-		*numBuf = strconv.AppendUint((*numBuf)[:0], v.Uint(), 10)
-		buf.Write(*numBuf)
-		putNumberBuf(numBuf)
-		return nil
-
 	case reflect.Array, reflect.Slice:
 		// Special case for empty arrays
 		if v.Len() == 0 {
@@ -133,7 +141,6 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 		}
 
 		return marshalArray(v, buf)
-
 	case reflect.Map:
 		// Special case for empty maps
 		if v.Len() == 0 {
@@ -141,11 +148,10 @@ func marshalValue(v reflect.Value, buf *Buffer) error {
 			buf.WriteByte(jsonCloseBrace)
 			return nil
 		}
-		return marshalMap(v, buf)
 
+		return marshalMap(v, buf)
 	case reflect.Struct:
 		return marshalStruct(v, buf)
-
 	default:
 		return fmt.Errorf("json: unsupported type: %s", v.Type().String())
 	}
@@ -369,12 +375,32 @@ func marshalMap(v reflect.Value, buf *Buffer) error {
 
 				// Write key (we know it's a string)
 				buf.WriteByte(jsonQuote)
-				s := key.String()
+				var s string
+				if key.Kind() == reflect.String {
+					s = key.String() // Use String() for reflect.String kind
+				} else if key.CanInterface() {
+					// Try to extract string via interface
+					switch k := key.Interface().(type) {
+					case string:
+						s = k
+					default:
+						// Last resort - use fmt to convert to string
+						s = fmt.Sprintf("%v", k)
+					}
+				} else {
+					// Fallback
+					s = fmt.Sprintf("%v", key)
+				}
+
 				if !needsEscaping(s) {
-					buf.WriteString(s)
+					_, err := buf.WriteString(s)
+					if err != nil {
+						return err
+					}
 				} else {
 					writeEscapedStringString(buf, s)
 				}
+
 				buf.Write(jsonQuoteColon)
 
 				// Marshal value with original key
@@ -697,22 +723,43 @@ func marshalStruct(v reflect.Value, buf *Buffer) error {
 	// Write opening brace
 	buf.WriteByte(jsonOpenBrace)
 
+	fieldCount := 0
 	// Process all fields with direct writing to buffer
 	for i := 0; i < len(fields); i++ {
 		f := &fields[i]
 		fv := v.FieldByIndex(f.index)
+
+		// Skip empty fields with omitempty tag
 		if f.omitEmpty && isEmptyValue(fv) {
 			continue
 		}
 
-		if i > 0 {
+		// Add comma if not the first field
+		if fieldCount > 0 {
 			buf.WriteByte(jsonComma)
 		}
+		fieldCount++
 
 		// Write field name
 		buf.Write(f.nameWithQuotesBytes)
 
-		// Marshal value directly to the provided buffer
+		// Special handling for string tag option
+		if f.stringOpt {
+			switch fv.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+				reflect.Float32, reflect.Float64, reflect.Bool:
+				// For numeric types with string tag, wrap in quotes
+				buf.WriteByte(jsonQuote)
+				if err := marshalValue(fv, buf); err != nil {
+					return err
+				}
+				buf.WriteByte(jsonQuote)
+				continue
+			}
+		}
+
+		// Regular marshaling for all other cases
 		if err := marshalValue(fv, buf); err != nil {
 			return err
 		}

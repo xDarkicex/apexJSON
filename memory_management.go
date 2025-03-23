@@ -306,7 +306,9 @@ func putIndexSlice(indexes []int) {
 
 func (b *Buffer) Write(p []byte) (n int, err error) {
 	b.grow(len(p))
-	return copy(b.buf[b.off:], p), nil
+	n = copy(b.buf[b.off:], p)
+	b.off += n // Add this line to update the offset
+	return n, nil
 }
 
 func (b *Buffer) WriteByte(c byte) error {
@@ -315,34 +317,6 @@ func (b *Buffer) WriteByte(c byte) error {
 	b.off++
 	return nil
 }
-
-// func (b *Buffer) grow(n int) {
-// 	needed := b.off + n
-
-// 	if needed <= cap(b.buf) {
-// 		b.buf = b.buf[:needed]
-// 		return
-// 	}
-
-// 	// New growth strategy
-// 	newCap := cap(b.buf)
-// 	switch {
-// 	case newCap == 0:
-// 		newCap = 64
-// 	case newCap < 4096:
-// 		newCap <<= 1 // Double until 4KB
-// 	default:
-// 		newCap += newCap / 4 // 25% growth beyond 4KB
-// 	}
-
-// 	if newCap < needed {
-// 		newCap = needed
-// 	}
-
-// 	newBuf := make([]byte, needed, newCap)
-// 	copy(newBuf, b.buf[:b.off])
-// 	b.buf = newBuf
-// }
 
 func (b *Buffer) grow(n int) {
 	needed := b.off + n
@@ -460,20 +434,52 @@ func AppendBuffers(buffers [][]byte) []byte {
 }
 
 func (b *Buffer) Bytes() []byte {
-	return b.buf[b.off:]
+	return b.buf[:b.off]
 }
 
 // Add this method to your Buffer type
+// func (b *Buffer) WriteString(s string) (int, error) {
+// 	// Pre-grow the buffer if needed
+// 	if b.off+len(s) > cap(b.buf) {
+// 		b.grow(len(s))
+// 	}
+
+//		// Copy the string directly into the buffer's slice
+//		n := copy(b.buf[b.off:], s)
+//		b.off += n
+//		return n, nil
+//	}
+// func (b *Buffer) WriteString(s string) (int, error) {
+// 	sLen := len(s)
+// 	if b.off+sLen > cap(b.buf) {
+// 		b.grow(sLen)
+// 	}
+
+// 	// Use a manual byte-by-byte copy to ensure data is written correctly
+// 	for i := 0; i < len(s); i++ {
+// 		b.buf[b.off+i] = s[i]
+// 	}
+
+//		b.off += sLen
+//		return sLen, nil
+//	}
 func (b *Buffer) WriteString(s string) (int, error) {
+	sLen := len(s)
+
 	// Pre-grow the buffer if needed
-	if b.off+len(s) > cap(b.buf) {
-		b.grow(len(s))
+	if b.off+sLen > cap(b.buf) {
+		b.grow(sLen)
+	}
+
+	// Ensure the buffer's length includes the area we want to write to
+	if b.off+sLen > len(b.buf) {
+		b.buf = b.buf[:b.off+sLen]
 	}
 
 	// Copy the string directly into the buffer's slice
-	n := copy(b.buf[b.off:], s)
-	b.off += n
-	return n, nil
+	copy(b.buf[b.off:], s)
+	b.off += sLen
+	return sLen, nil
 }
 
 // getCachedFields retrieves field information from cache or computes it
@@ -519,6 +525,7 @@ func computeStructFields(t reflect.Type) []Field {
 
 		// Parse tag without allocations
 		omitEmpty := false
+		stringOpt := false // Add this variable
 		if tag != "" {
 			// Find first comma in tag
 			commaIndex := -1
@@ -535,7 +542,7 @@ func computeStructFields(t reflect.Type) []Field {
 					name = tag[:commaIndex]
 				}
 
-				// Check for omitempty flag without allocations
+				// Check for options without allocations
 				tagRest := tag[commaIndex+1:]
 				j := 0
 				for j < len(tagRest) {
@@ -547,11 +554,12 @@ func computeStructFields(t reflect.Type) []Field {
 						j++
 					}
 
-					// Check if this option is "omitempty"
+					// Check if this option is "omitempty" or "string"
 					option := tagRest[optionStart:j]
 					if option == "omitempty" {
 						omitEmpty = true
-						break
+					} else if option == "string" {
+						stringOpt = true // Set this to true when option found
 					}
 
 					// Move past comma
@@ -564,14 +572,10 @@ func computeStructFields(t reflect.Type) []Field {
 		}
 
 		// Create and append Field
-		// Create index slice only once per field
 		index := make([]int, len(f.Index))
 		copy(index, f.Index)
 
-		// Create nameBytes only once
 		nameBytes := []byte(name)
-
-		// Create the nameWithQuotes format more efficiently
 		nameWithQuotesBytes := make([]byte, len(name)+3) // "name":
 		nameWithQuotesBytes[0] = '"'
 		copy(nameWithQuotesBytes[1:], nameBytes)
@@ -583,6 +587,7 @@ func computeStructFields(t reflect.Type) []Field {
 			nameWithQuotesBytes: nameWithQuotesBytes,
 			index:               index,
 			omitEmpty:           omitEmpty,
+			stringOpt:           stringOpt, // Add the new field
 		})
 	}
 
