@@ -1,6 +1,9 @@
 # apexJSON: High-Performance JSON for Go 🚀
 
-[![GoDoc](https://godoc.org/github.com/yourusername/apexJSON?status.ub.com/yourusername/apexJSON Card](https://goreportcard.com/badge/github.com/yogoreportcard.com/report/github.com/yourusername/apexJSO MIT](https://img.shields.io/opensource.org/licenses/M*apexJSON**, a high-performance, drop-in replacement for Go's standard `encoding/json` package. It's designed for developers who need blazing-fast JSON processing without external dependencies. 
+[![GoDoc](https://godoc.org/github.com/xDarkicex/apexJSON)](https://godoc.org/github.com/xDarkicex/apexJSON)
+[![Go Report Card](https://goreportcard.com/badge/github.com/xDarkicex/apexJSON)](https://goreportcard.com/report/github.com/xDarkicex/apexJSON)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+a high-performance, drop-in replacement for Go's standard `encoding/json` package. It's designed for developers who need blazing-fast JSON processing without external dependencies. 
 
 ## ✨ Why apexJSON?
 
