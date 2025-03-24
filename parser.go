@@ -311,14 +311,3 @@ func countEscapeChars(s string) int {
 	}
 	return count
 }
-
-// Helper function to check if a string needs JSON escaping
-func needsEscaping(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x20 || c == '"' || c == '\\' {
-			return true
-		}
-	}
-	return false
-}

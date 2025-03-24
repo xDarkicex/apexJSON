@@ -47,10 +47,11 @@ type Encoder struct {
 
 // Decoder optimized with slices grouped together and largest fields first
 type Decoder struct {
-	buf      []byte    // 24 bytes (ptr + len + cap)
-	tokenBuf []byte    // 24 bytes (ptr + len + cap)
-	r        io.Reader // 16 bytes (interface)
-	readPos  int       // 8 bytes
+	buf       []byte    // 24 bytes (ptr + len + cap)
+	tokenBuf  []byte    // 24 bytes (ptr + len + cap)
+	r         io.Reader // 16 bytes (interface)
+	readPos   int       // 8 bytes
+	useNumber bool
 }
 
 // Field with slices grouped together and bool at the end to minimize padding
@@ -74,3 +75,5 @@ type fieldCacheKey struct {
 }
 
 type tagOptions string
+
+type Number string

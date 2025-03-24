@@ -1,0 +1,86 @@
+package apexJSON
+
+// memory_management_summary.txt
+
+// Pools: builder, byte buffers (tiny, small, medium, large), object maps, array slices, errors, token buffers, key slices, field maps, number buffers, index slices, field cache.
+var (
+        builderPool sync.Pool // strings.Builder
+        tinyBuffers sync.Pool // Buffer (<= 64)
+        smallBuffers sync.Pool // Buffer (<= 256)
+        mediumBuffers sync.Pool // Buffer (<= 1024)
+        largeBuffers sync.Pool // Buffer (<= 4096)
+        objectMapPool sync.Pool // map[string]interface{}
+        arraySlicePool sync.Pool // []interface{}
+        syntaxErrorPool sync.Pool // *SyntaxError
+        tokenBufPool sync.Pool // *[]byte (tokens)
+        keySlicePool sync.Pool // *[]reflect.Value (keys)
+        fieldMapPool sync.Pool // map[string]Field
+        numberBufPool sync.Pool // *[]byte (numbers)
+        indexSlicePool sync.Pool // []int (indexes)
+        keysPool sync.Pool // []reflect.Value (keys)
+        fieldCache sync.Map // struct fields
+)
+
+// init: Warm pools, cache struct fields.
+func init()
+
+// WarmupPools: Initialize byte buffer pools.
+func WarmupPools()
+
+// getBuffer/getBufferSize/putBuffer: Get/put byte Buffers.
+func getBuffer() *Buffer
+func getBufferSize(sizeHint int) *Buffer
+func putBuffer(buf *Buffer)
+
+// getBuilder/putBuilder: Get/put strings.Builder.
+func getBuilder() *strings.Builder
+func putBuilder(b *strings.Builder)
+
+// getObjectMap/putObjectMap: Get/put object maps.
+func getObjectMap() map[string]interface{}
+func putObjectMap(m map[string]interface{})
+
+// getArraySlice/putArraySlice: Get/put array slices.
+func getArraySlice() []interface{}
+func putArraySlice(s []interface{})
+
+// getSyntaxError/putSyntaxError: Get/put SyntaxError.
+func getSyntaxError() *SyntaxError
+func putSyntaxError(e *SyntaxError)
+
+// getTokenBuf/putTokenBuf: Get/put token buffers.
+func getTokenBuf() *[]byte
+func putTokenBuf(buf *[]byte)
+
+// getKeysSlice/putKeysSlice: Get/put key slices.
+func getKeysSlice() *[]reflect.Value
+func putKeysSlice(keys *[]reflect.Value)
+
+// getFieldMap/putFieldMap: Get/put field maps.
+func getFieldMap() map[string]Field
+func putFieldMap(m map[string]Field)
+
+// getNumberBuf/putNumberBuf: Get/put number buffers.
+func getNumberBuf() *[]byte
+func putNumberBuf(buf *[]byte)
+
+// getIndexSlice/putIndexSlice: Get/put index slices.
+func getIndexSlice() []int
+func putIndexSlice(indexes []int)
+
+// (Buffer) Write/WriteByte/grow/Reset/ReadFrom/ReadString/Seek/Bytes/WriteString: Buffer manipulation.
+func (b *Buffer) Write(p []byte) (n int, err error)
+func (b *Buffer) WriteByte(c byte) error
+func (b *Buffer) grow(n int)
+func (b *Buffer) Reset()
+func (b *Buffer) ReadFrom(r io.Reader) (int64, error)
+func (b *Buffer) ReadString(length int) string
+func (b *Buffer) Seek(offset int)
+func (b *Buffer) Bytes() []byte
+func (b *Buffer) WriteString(s string) (int, error)
+
+// AppendBuffers: Combine byte slices.
+func AppendBuffers(buffers [][]byte) []byte
+
+// computeStructFields: Extract struct field info.
+func computeStructFields(t reflect.Type) []Field

@@ -91,6 +91,7 @@ var (
 )
 
 func init() {
+
 	WarmupPools()
 	commonTypes := []interface{}{
 		"", 0, false,
@@ -400,12 +401,16 @@ func (b *Buffer) Seek(offset int) {
 	}
 }
 
+// AppendBuffers combines multiple byte slices into a single result slice,
+// ensuring proper memory management and safety with pooled buffers.
 func AppendBuffers(buffers [][]byte) []byte {
 	// Early return for empty or single buffer cases
 	if len(buffers) == 0 {
 		return []byte{}
 	}
+
 	if len(buffers) == 1 {
+		// Create a new slice to prevent modifications to the original
 		result := make([]byte, len(buffers[0]))
 		copy(result, buffers[0])
 		return result
@@ -417,18 +422,15 @@ func AppendBuffers(buffers [][]byte) []byte {
 		totalSize += len(b)
 	}
 
-	// Get pooled buffer of appropriate size
-	buf := getBufferSize(totalSize)
-	defer putBuffer(buf)
+	// Allocate a single result buffer of exactly the right size
+	result := make([]byte, totalSize)
 
-	// Single append for each buffer
+	// Copy all buffers directly into the result at the appropriate offset
+	offset := 0
 	for _, b := range buffers {
-		buf.Write(b)
+		copy(result[offset:], b)
+		offset += len(b)
 	}
-
-	// Create result copy
-	result := make([]byte, buf.off)
-	copy(result, buf.buf[:buf.off])
 
 	return result
 }
@@ -480,24 +482,6 @@ func (b *Buffer) WriteString(s string) (int, error) {
 	copy(b.buf[b.off:], s)
 	b.off += sLen
 	return sLen, nil
-}
-
-// getCachedFields retrieves field information from cache or computes it
-func getCachedFields(t reflect.Type) []Field {
-	key := fieldCacheKey{rtype: t}
-
-	// Check cache first
-	if cached, ok := fieldCache.Load(key); ok {
-		return cached.([]Field)
-	}
-
-	// Not in cache - compute field information
-	fields := computeStructFields(t)
-
-	// Store in cache for future use
-	fieldCache.Store(key, fields)
-
-	return fields
 }
 
 // computeStructFields analyzes a struct type and extracts field information
@@ -587,7 +571,7 @@ func computeStructFields(t reflect.Type) []Field {
 			nameWithQuotesBytes: nameWithQuotesBytes,
 			index:               index,
 			omitEmpty:           omitEmpty,
-			stringOpt:           stringOpt, // Add the new field
+			stringOpt:           stringOpt,
 		})
 	}
 

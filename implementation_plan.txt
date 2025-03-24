@@ -1,0 +1,70 @@
+I. Core Issues Identified:
+
+    A. Malformed JSON Decoding:
+        1.  Incorrect string escape sequence handling (parseString, parseStringToBuffer).
+        2.  Incorrect buffer reset in refillBuffer (d.readPos = 0).
+        3.  Flawed state tracking (readValue, depth, inString, escaped).
+        4.  Overly complex state management in readValue leading to errors.
+        5.  Inconsistent whitespace handling.
+        6.  Problematic large token buffer management (buffers slice).
+    B. Weaknesses in Current Implementation:
+        1.  Ad-hoc state management, not a formal state machine.
+        2.  Complex memory management, increasing leak risk.
+        3.  Insufficient error context.
+        4.  Debug statements in production code.
+        5.  Inefficient token handling (byte slice passing).
+        6.  Lack of clear state transitions.
+        7.  Overlapping responsibilities (Parser, Decoder).
+        8.  Inefficient Buffer Allocation in refillBuffer (new allocation).
+        9.  Misuse of pooled resources (error paths).
+
+II. Proposed State Machine Design:
+
+    A. Core States:
+        1.  StateValue, StateObjectKey, StateObjectColon, StateObjectValue, StateObjectComma.
+        2.  StateArrayValue, StateArrayComma, StateString, StateStringEscape, StateNumber.
+        3.  StateTrue, StateFalse, StateNull, StateDone, StateError.
+        4.  Token-based design to separate lexical analysis from parsing.
+    B. Implementation Structure:
+        1.  Parser struct with data, pos, state, stateStack, tokenBuf, valueStack, currentKey, containerStack.
+        2.  Lexer struct with buffer, state, offset, NextToken method.
+    C. Memory Management:
+        1.  Use pooled buffers/slices for all operations.
+        2.  Stream processing model (ProcessChunk).
+    D. Token Callbacks:
+        1.  TokenHandler interface (OnObjectStart, OnObjectEnd, OnArrayStart, etc.).
+    E. Error Recovery and Reporting:
+        1.  handleError method, SyntaxError with context.
+        2.  Improved SyntaxError with Msg, Offset, Context, Expected, Found.
+    F. String Handling:
+        1.  Correct escape sequence decoding (readEscapeSequence).
+    G. Depth Tracking:
+        1.  Explicit state stack (non-recursive).
+    H. Streaming Support:
+        1.  Design for efficient streaming (Decode).
+
+III. Implementation Strategy:
+
+    A. Complete Rewrite:
+        1.  Implement a new Parser struct with a clear state machine.
+        2.  Create a Lexer struct for tokenization.
+        3.  Use the provided memory management functions (memory_management.go).
+    B. Function Removal/Refactoring:
+        1.  Remove/refactor readValue, parseString, parseStringToBuffer, refillBuffer.
+        2.  Separate parsing and lexical analysis.
+    C. Memory Management:
+        1.  Ensure all buffers and slices are pooled and returned.
+        2.  Optimize buffer growth strategy.
+    D. Error Handling:
+        1.  Implement detailed error reporting with context.
+        2.  Ensure proper error recovery within the state machine.
+    E. Performance:
+        1.  Maintain the goal of high performance and low allocation.
+        2.  Benchmark and profile to identify and eliminate bottlenecks.
+
+IV. Next Steps:
+
+    A. Design the state transition table.
+    B. Implement the Lexer and Parser structs.
+    C. Implement the TokenHandler interface.
+    D. Test thoroughly with various JSON inputs.

@@ -1,0 +1,55 @@
+package apexJSON
+
+// helpers_summary.txt
+
+// Number: Int64, Float64, String, MustInt64, MustFloat64, IsInt, IsFloat, Format (int/float formats).
+type Number string
+func (n Number) Int64() (int64, error)
+func (n Number) Float64() (float64, error)
+func (n Number) String() string
+func (n Number) MustInt64() int64
+func (n Number) MustFloat64() float64
+func (n Number) IsInt() bool
+func (n Number) IsFloat() bool
+func (n Number) Format(format string) string
+
+// setNull: Sets reflect.Value to zero value.
+func setNull(v reflect.Value) error
+
+// setBool: Sets reflect.Value to boolean.
+func setBool(v reflect.Value, b bool) error
+
+// setString: Sets reflect.Value to string.
+func setString(v reflect.Value, s string) error
+
+// writeEscapedString/writeEscapedStringString: Writes escaped JSON string.
+func writeEscapedString(w io.Writer, s []byte)
+func writeEscapedStringString(w io.Writer, s string)
+
+// needsEscaping: Checks if string needs JSON escaping.
+func needsEscaping(s string) bool
+
+// setNumber: Sets reflect.Value to number (int/float).
+func setNumber(v reflect.Value, s string, decoder *Decoder) error
+
+// isDigit: Checks if byte is digit.
+func isDigit(c byte) bool
+
+// GetString: Converts byte slice to string (unsafe).
+func GetString(b []byte) string
+
+// estimateKeySize/estimateValueSize: Estimates size for pre-allocation.
+func estimateKeySize(key reflect.Value) int
+func estimateValueSize(v reflect.Value) int
+
+// isEmptyValue: Checks if reflect.Value is empty for omitempty.
+func isEmptyValue(v reflect.Value) bool
+
+// getCachedFields: Gets struct field info from cache.
+func getCachedFields(t reflect.Type) []Field
+
+// isWhitespace: Checks if byte is whitespace.
+func isWhitespace(c byte) bool
+
+// isCompleteLiteral: Checks if string is complete JSON literal.
+func isCompleteLiteral(s string) bool

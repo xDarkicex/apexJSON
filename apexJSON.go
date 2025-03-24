@@ -5,8 +5,6 @@ import (
 	"io"
 	"reflect"
 	"strconv"
-	"time"
-	"unsafe"
 )
 
 // Token types
@@ -25,6 +23,21 @@ const (
 )
 
 const hex = "0123456789abcdef"
+
+const (
+	FloatPrecision2     = "%.2f"
+	FloatPrecision3     = "%.3f"
+	FloatPrecision4     = "%.4f"
+	FloatGeneral        = "%g"
+	FloatScientificE    = "%e"
+	FloatScientificCapE = "%E"
+	IntFormat           = "%d"
+	IntHex              = "%x"  // Hexadecimal lowercase
+	IntHexUpper         = "%X"  // Hexadecimal uppercase
+	IntBinary           = "%b"  // Binary
+	IntOctal            = "%o"  // Octal
+	FloatComma          = "%'f" // With thousand separators (Go 1.23+)
+)
 
 var (
 	jsonQuoteColon   = []byte{'"', ':'}
@@ -109,11 +122,16 @@ func NewEncoder(w io.Writer) *Encoder {
 }
 
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{
-		r:        r,
-		buf:      make([]byte, 4096),
-		tokenBuf: *getTokenBuf(),
+	fmt.Println("Creating new decoder")
+	d := &Decoder{
+		r:         r,
+		buf:       make([]byte, 0, 4096),
+		tokenBuf:  *getTokenBuf(),
+		useNumber: false,
 	}
+	fmt.Printf("NewDecoder: buf len=%d, cap=%d\n", len(d.buf), cap(d.buf))
+	d.readPos = 0
+	return d
 }
 
 func (e *Encoder) Encode(v interface{}) error {
@@ -135,6 +153,7 @@ func (e *Encoder) Encode(v interface{}) error {
 }
 
 func (d *Decoder) Decode(v interface{}) error {
+	fmt.Printf("Decode called: buf len=%d, readPos=%d\n", len(d.buf), d.readPos)
 	// Skip any whitespace
 	if err := d.skipWhitespace(); err != nil {
 		if err == io.EOF {
@@ -360,6 +379,7 @@ func GetObject(data []byte, path ...string) (map[string]interface{}, bool) {
 // skipWhitespace skips whitespace in the decoder's buffer
 func (d *Decoder) skipWhitespace() error {
 	for {
+		// Skip any whitespace in current buffer
 		for d.readPos < len(d.buf) {
 			c := d.buf[d.readPos]
 			if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
@@ -368,63 +388,110 @@ func (d *Decoder) skipWhitespace() error {
 			d.readPos++
 		}
 
-		// Need more data
-		n, err := d.r.Read(d.buf)
-		if err != nil {
+		// Need more data - use refillBuffer instead of direct read
+		if err := d.refillBuffer(); err != nil {
+			if err == io.EOF {
+				return err
+			}
 			return err
 		}
 
-		d.readPos = 0
-		d.buf = d.buf[:n]
+		// If buffer is still empty after refill, we're done
+		if len(d.buf) == 0 {
+			return io.EOF
+		}
 	}
 }
 
-// readValue reads a complete JSON value from the decoder's buffer
+func (d *Decoder) UseNumber() *Decoder {
+	d.useNumber = true
+	return d
+}
+
 func (d *Decoder) readValue() ([]byte, error) {
-	// Get a fresh token buffer from the pool (save the old one)
+	// Get a fresh token buffer from the pool
 	oldBuf := d.tokenBuf
 	d.tokenBuf = *getTokenBuf()
+	defer func() {
+		// Always return the buffer to the pool if we exit early
+		if &d.tokenBuf != &oldBuf {
+			putTokenBuf(&d.tokenBuf)
+		}
+	}()
 
-	// Track nesting depth
+	// Make sure we have data to read
+	if len(d.buf) == 0 || d.readPos >= len(d.buf) {
+		if err := d.refillBuffer(); err != nil {
+			d.tokenBuf = oldBuf
+			return nil, err
+		}
+	}
+
+	// Track parsing state
 	depth := 0
 	inString := false
 	escaped := false
+	buffers := make([][]byte, 0, 4)
 
-	// Create a slice to hold byte slices
-	buffers := make([][]byte, 0, 4) // Initial capacity of 4
+	// Record first character for validation
+	firstChar := d.buf[d.readPos]
 
-	for {
-		// Ensure we have data
+	// Skip initial whitespace
+	for d.readPos < len(d.buf) && isWhitespace(d.buf[d.readPos]) {
+		d.readPos++
 		if d.readPos >= len(d.buf) {
-			n, err := d.r.Read(d.buf)
-			if err != nil {
-				if err == io.EOF && len(buffers) > 0 {
-					// Combine all buffers
-					result := AppendBuffers(append(buffers, d.tokenBuf))
-
-					// Return the buffer to the pool
-					putTokenBuf(&d.tokenBuf)
-
-					// Restore old buffer (potentially for next call)
-					d.tokenBuf = oldBuf
-
-					return result, nil
-				}
-				// Handle error case
-				putTokenBuf(&d.tokenBuf)
+			if err := d.refillBuffer(); err != nil {
 				d.tokenBuf = oldBuf
 				return nil, err
 			}
-			d.readPos = 0
-			d.buf = d.buf[:n]
+		}
+	}
+
+	// Ensure we have non-whitespace data
+	if d.readPos >= len(d.buf) {
+		d.tokenBuf = oldBuf
+		return nil, io.EOF
+	}
+
+	// Main parsing loop
+	for {
+		// Ensure we have data
+		if d.readPos >= len(d.buf) {
+			if err := d.refillBuffer(); err != nil {
+				if err == io.EOF && len(d.tokenBuf) > 0 {
+					// We have a partial value but no more data
+					if depth > 0 {
+						// Unclosed object or array
+						d.tokenBuf = oldBuf
+						return nil, fmt.Errorf("unexpected end of JSON input: unclosed structure")
+					}
+
+					// Return what we have if it makes sense as a complete value
+					tokenStr := string(d.tokenBuf)
+					if isCompleteLiteral(tokenStr) {
+						result := AppendBuffers(append(buffers, d.tokenBuf))
+						d.tokenBuf = oldBuf
+						return result, nil
+					} else if len(d.tokenBuf) >= 2 &&
+						((d.tokenBuf[0] == '{' && d.tokenBuf[len(d.tokenBuf)-1] == '}') ||
+							(d.tokenBuf[0] == '[' && d.tokenBuf[len(d.tokenBuf)-1] == ']')) {
+						result := AppendBuffers(append(buffers, d.tokenBuf))
+						d.tokenBuf = oldBuf
+						return result, nil
+					}
+				}
+
+				d.tokenBuf = oldBuf
+				return nil, err
+			}
 		}
 
-		// Process character
+		// Process the current character
 		c := d.buf[d.readPos]
 		d.tokenBuf = append(d.tokenBuf, c)
 		d.readPos++
 
-		// Track state using same logic as before
+		// Handle string context
 		if inString {
 			if escaped {
 				escaped = false
@@ -432,56 +499,110 @@ func (d *Decoder) readValue() ([]byte, error) {
 				escaped = true
 			} else if c == '"' {
 				inString = false
-				// If not in a container, we're done
-				if depth == 0 {
-					break
+
+				// If we're at the top level and this is a standalone string, we're done
+				if depth == 0 && firstChar == '"' {
+					result := AppendBuffers(append(buffers, d.tokenBuf))
+					d.tokenBuf = oldBuf
+					return result, nil
 				}
 			}
-		} else {
-			switch c {
-			case '"':
-				inString = true
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-				// If we've closed the outer container, we're done
-				if depth == 0 {
-					break
+			continue // Skip other processing for string content
+		}
+
+		// Handle structural elements and literals when not in a string
+		switch c {
+		case '"':
+			inString = true
+
+		case '{', '[':
+			depth++
+
+		case '}', ']':
+			depth--
+
+			// If we've closed the outermost structure, we're done
+			if depth == 0 {
+				// Ensure brackets match: { must close with }, [ with ]
+				isValid := (firstChar == '{' && c == '}') || (firstChar == '[' && c == ']')
+				if !isValid {
+					d.tokenBuf = oldBuf
+					return nil, fmt.Errorf("mismatched brackets in JSON")
 				}
-			case 't', 'f', 'n', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-':
-				// Process standalone literals as before
-				// ...
+
+				result := AppendBuffers(append(buffers, d.tokenBuf))
+				d.tokenBuf = oldBuf
+				return result, nil
+			} else if depth < 0 {
+				// This means we have an extra closing brace/bracket
+				d.tokenBuf = oldBuf
+				return nil, fmt.Errorf("unexpected closing character in JSON")
+			}
+
+		case ' ', '\t', '\r', '\n':
+			// Whitespace terminates top-level literals (but not nested ones)
+			if depth == 0 && firstChar != '{' && firstChar != '[' && firstChar != '"' {
+				// Check if we have a complete literal (excluding this whitespace)
+				tokenLen := len(d.tokenBuf)
+				valueBytes := d.tokenBuf[:tokenLen-1] // Exclude the whitespace
+
+				if isCompleteLiteral(string(valueBytes)) {
+					result := AppendBuffers(append(buffers, valueBytes))
+					d.tokenBuf = oldBuf
+					// Adjust read position back by one since we didn't consume this whitespace
+					d.readPos--
+					return result, nil
+				}
+			}
+
+		case ',', ':':
+			// These characters are only valid inside objects/arrays
+			if depth == 0 {
+				d.tokenBuf = oldBuf
+				return nil, fmt.Errorf("unexpected character in JSON literal: %c", c)
 			}
 		}
 
 		// If the current token buffer is getting large, add it to buffers and get a new one
 		if len(d.tokenBuf) >= 4096 {
-			buffers = append(buffers, d.tokenBuf)
+			// Create a copy to avoid buffer modification issues
+			tokenCopy := make([]byte, len(d.tokenBuf))
+			copy(tokenCopy, d.tokenBuf)
+			buffers = append(buffers, tokenCopy)
+
+			putTokenBuf(&d.tokenBuf)
 			d.tokenBuf = *getTokenBuf()
 		}
 	}
-
-	// Combine all buffers
-	result := AppendBuffers(append(buffers, d.tokenBuf))
-
-	// Return buffer to pool
-	putTokenBuf(&d.tokenBuf)
-
-	// Restore old buffer
-	d.tokenBuf = oldBuf
-
-	return result, nil
 }
 
-// isDigit returns true if c is an ASCII digit
-func isDigit(c byte) bool {
-	return c >= '0' && c <= '9'
-}
+// Helper function to refill the buffer
+func (d *Decoder) refillBuffer() error {
+	// Use a smaller fixed size instead of full capacity
+	fmt.Printf("refillBuffer: attempting to read with buf cap=%d\n", cap(d.buf))
+	temp := make([]byte, 512) // Or even smaller like 128
+	n, err := d.r.Read(temp)
+	fmt.Printf("refillBuffer: read %d bytes, err=%v\n", n, err)
+	if n > 0 {
+		fmt.Printf("refillBuffer: first byte=%d (%c)\n", temp[0], temp[0])
+	}
+	// Handle EOF with data case explicitly
+	if err == io.EOF && n > 0 {
+		err = nil // EOF with data is not an error for us
+	}
 
-// GetString converts a byte slice to a string without allocation
-func GetString(b []byte) string {
-	return *(*string)(unsafe.Pointer(&b))
+	if n > 0 {
+		// Append to existing buffer if needed
+		d.buf = append(d.buf, temp[:n]...)
+		// Or replace if empty: d.buf = temp[:n]
+	}
+
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	d.readPos = 0
+	return nil
 }
 
 // ### Extraction ###
@@ -777,106 +898,6 @@ func GetArray(data []byte, path ...string) ([]interface{}, bool) {
 	return finalResult, true
 }
 
-// estimateKeySize provides a rough size estimate for a key (used for pre-allocation)
-func estimateKeySize(key reflect.Value) int {
-	switch key.Kind() {
-	case reflect.String:
-		return len(key.String()) + 2 // Quotes + content
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return 12 // Rough max for int64
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return 12 // Rough max for uint64
-	case reflect.Float32, reflect.Float64:
-		return 16 // Rough max for float64
-	case reflect.Bool:
-		return 5 // "true" or "false"
-	case reflect.Array, reflect.Slice:
-		if key.Type().Elem().Kind() == reflect.Uint8 {
-			return 2 + (key.Len() * 2) // "0x" + hex bytes
-		}
-		return 8 // "empty" or "array"
-	case reflect.Struct:
-		if key.Type().String() == "time.Time" {
-			return len(time.RFC3339)
-		}
-		return 16 // Rough estimate for structs
-	case reflect.Map:
-		return 10 // Rough estimate for "map[n]"
-	default:
-		return 16 // Conservative default
-	}
-}
-
-// estimateValueSize provides a rough size estimate for a value (used for pre-allocation)
-func estimateValueSize(v reflect.Value) int {
-	if !v.IsValid() || (v.Kind() == reflect.Ptr && v.IsNil()) {
-		return 4 // "null"
-	}
-
-	switch v.Kind() {
-	case reflect.Bool:
-		return 5 // "true" or "false"
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return 12 // Rough max for int64
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return 12 // Rough max for uint64
-	case reflect.Float32, reflect.Float64:
-		return 16 // Rough max for float64
-	case reflect.String:
-		return len(v.String()) + 2 // Quotes + content
-	case reflect.Array, reflect.Slice:
-		if v.Len() == 0 {
-			return 2 // "[]"
-		}
-		if v.Type().Elem().Kind() == reflect.Uint8 {
-			return 2 + (v.Len() * 2) // "[" + bytes + "]"
-		}
-		return 2 + (v.Len() * 4) // Rough estimate for arrays
-	case reflect.Map:
-		if v.Len() == 0 {
-			return 2 // "{}"
-		}
-		return 2 + (v.Len() * 8) // Rough estimate for maps
-	case reflect.Struct:
-		return 32 // Conservative estimate for structs
-	default:
-		return 16 // Conservative default
-	}
-}
-
-// isEmptyValue reports whether v is considered empty for omitempty
-func isEmptyValue(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Bool:
-		return !v.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return v.Uint() == 0
-	case reflect.Float32, reflect.Float64:
-		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
-		return v.IsNil()
-	case reflect.Struct:
-		// Special case for time.Time
-		if v.Type().String() == "time.Time" && v.CanInterface() {
-			if t, ok := v.Interface().(time.Time); ok {
-				return t.IsZero()
-			}
-		}
-		// Otherwise check all fields
-		for i := 0; i < v.NumField(); i++ {
-			if !isEmptyValue(v.Field(i)) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
 func structFields(t reflect.Type) []Field {
 	return getCachedFields(t)
 }
@@ -944,36 +965,4 @@ func parseTag(tag string) (string, tagOptions) {
 
 	// No comma found, return the whole tag as the name
 	return tag, ""
-}
-
-func writeEscapedStringString(w io.Writer, s string) {
-	// Fast path for Buffer type - direct string handling
-	if buf, ok := w.(*Buffer); ok {
-		start := 0
-		// Pre-grow buffer to avoid multiple resizes
-		buf.grow(len(s) + 16) // Extra space for potential escapes
-
-		for i := 0; i < len(s); i++ {
-			if esc := escapeMap[s[i]]; esc != nil {
-				// Write unescaped portion directly
-				if start < i {
-					buf.off += copy(buf.buf[buf.off:], s[start:i])
-				}
-
-				// Write escape sequence directly
-				buf.off += copy(buf.buf[buf.off:], esc)
-				start = i + 1
-			}
-		}
-
-		// Write final unescaped portion
-		if start < len(s) {
-			buf.off += copy(buf.buf[buf.off:], s[start:])
-		}
-
-		return
-	}
-
-	// Fallback for non-Buffer writers (use the optimized writeEscapedString)
-	writeEscapedString(w, []byte(s))
 }

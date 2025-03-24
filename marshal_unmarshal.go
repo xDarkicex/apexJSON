@@ -744,6 +744,7 @@ func marshalStruct(v reflect.Value, buf *Buffer) error {
 		buf.Write(f.nameWithQuotesBytes)
 
 		// Special handling for string tag option
+		// This is strange if why have a switch case with only one case that matches basically everything?
 		if f.stringOpt {
 			switch fv.Kind() {
 			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -768,55 +769,6 @@ func marshalStruct(v reflect.Value, buf *Buffer) error {
 	// Write closing brace
 	buf.WriteByte(jsonCloseBrace)
 	return nil
-}
-
-// Replace with batch writes
-func writeEscapedString(w io.Writer, s []byte) {
-	// Fast path for Buffer type - direct writing without interface calls
-	if buf, ok := w.(*Buffer); ok {
-		start := 0
-		// Pre-grow buffer to avoid multiple resizes
-		buf.grow(len(s) + 16) // Extra space for potential escapes
-
-		for i := 0; i < len(s); i++ {
-			if esc := escapeMap[s[i]]; esc != nil {
-				// Write unescaped portion directly
-				if start < i {
-					copy(buf.buf[buf.off:], s[start:i])
-					buf.off += i - start
-				}
-
-				// Write escape sequence directly
-				copy(buf.buf[buf.off:], esc)
-				buf.off += len(esc)
-				start = i + 1
-			}
-		}
-
-		// Write final unescaped portion
-		if start < len(s) {
-			copy(buf.buf[buf.off:], s[start:])
-			buf.off += len(s) - start
-		}
-
-		return
-	}
-
-	// Fallback for non-Buffer writers
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if esc := escapeMap[s[i]]; esc != nil {
-			if start < i {
-				w.Write(s[start:i])
-			}
-			w.Write(esc)
-			start = i + 1
-		}
-	}
-
-	if start < len(s) {
-		w.Write(s[start:])
-	}
 }
 
 func unmarshalValue(p *Parser, v reflect.Value) error {
@@ -864,7 +816,7 @@ func unmarshalValue(p *Parser, v reflect.Value) error {
 		if tokenType != TokenNumber {
 			return &SyntaxError{Offset: int64(p.pos), Msg: "invalid number"}
 		}
-		return setNumber(v, GetString(value))
+		return setNumber(v, GetString(value), nil)
 	}
 
 	return &SyntaxError{Offset: int64(p.pos), Msg: "invalid JSON value"}
@@ -1109,112 +1061,4 @@ func unmarshalToSlice(p *Parser, v reflect.Value) error {
 	}
 
 	return &SyntaxError{Offset: int64(p.pos), Msg: "unexpected end of JSON input"}
-}
-
-// setNull sets a reflect.Value to its zero value
-func setNull(v reflect.Value) error {
-	switch v.Kind() {
-	case reflect.Interface, reflect.Ptr, reflect.Map, reflect.Slice:
-		v.Set(reflect.Zero(v.Type()))
-		return nil
-	}
-
-	return &UnmarshalTypeError{Value: "null", Type: v.Type()}
-}
-
-// setBool sets a reflect.Value to a boolean
-func setBool(v reflect.Value, b bool) error {
-	switch v.Kind() {
-	case reflect.Bool:
-		v.SetBool(b)
-		return nil
-	case reflect.Interface:
-		if v.NumMethod() == 0 {
-			v.Set(reflect.ValueOf(b))
-			return nil
-		}
-	}
-
-	return &UnmarshalTypeError{Value: "bool", Type: v.Type()}
-}
-
-// setString sets a reflect.Value to a string
-func setString(v reflect.Value, s string) error {
-	switch v.Kind() {
-	case reflect.String:
-		v.SetString(s)
-		return nil
-	case reflect.Interface:
-		if v.NumMethod() == 0 {
-			v.Set(reflect.ValueOf(s))
-			return nil
-		}
-	}
-
-	return &UnmarshalTypeError{Value: "string", Type: v.Type()}
-}
-
-// setNumber sets a reflect.Value to a number
-func setNumber(v reflect.Value, s string) error {
-	b := getBuilder()   // Get builder from pool
-	defer putBuilder(b) // Return to pool when done
-
-	switch v.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		n, err := strconv.ParseInt(s, 10, 64)
-		if err != nil {
-			b.WriteString("number ")
-			b.WriteString(s)
-			return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-		}
-		if v.OverflowInt(n) {
-			b.WriteString("number ")
-			b.WriteString(s)
-			return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-		}
-		v.SetInt(n)
-		return nil
-
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		n, err := strconv.ParseUint(s, 10, 64)
-		if err != nil {
-			b.WriteString("number ")
-			b.WriteString(s)
-			return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-		}
-		if v.OverflowUint(n) {
-			b.WriteString("number ")
-			b.WriteString(s)
-			return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-		}
-		v.SetUint(n)
-		return nil
-
-	case reflect.Float32, reflect.Float64:
-		n, err := strconv.ParseFloat(s, v.Type().Bits())
-		if err != nil {
-			b.WriteString("number ")
-			b.WriteString(s)
-			return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-		}
-		if v.OverflowFloat(n) {
-			b.WriteString("number ")
-			b.WriteString(s)
-			return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-		}
-		v.SetFloat(n)
-		return nil
-
-	case reflect.Interface:
-		if v.NumMethod() == 0 {
-			// Try float64 first for all numbers
-			if n, err := strconv.ParseFloat(s, 64); err == nil {
-				v.Set(reflect.ValueOf(n))
-				return nil
-			}
-		}
-	}
-
-	// Just "number" for general type error
-	return &UnmarshalTypeError{Value: "number", Type: v.Type()}
 }
