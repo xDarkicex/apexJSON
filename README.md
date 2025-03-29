@@ -160,6 +160,8 @@ apexJSON shines in these scenarios:
 * **Containerized Applications** - Keep your images small and dependencies minimal
 * **High-traffic Systems** - Reduce CPU and memory pressure from JSON processing
 
+* **Switching to true state machine
+
 ## 🏁 Conclusion
 
 apexJSON offers a powerful combination of performance, compatibility, and simplicity. With zero dependencies and optimized memory usage, it's the ideal JSON library for projects where efficiency matters.

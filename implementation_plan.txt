@@ -42,29 +42,40 @@ II. Proposed State Machine Design:
         1.  Explicit state stack (non-recursive).
     H. Streaming Support:
         1.  Design for efficient streaming (Decode).
+    I. Buffer Usage:
+        1.  Design the Lexer to directly populate tokens into the Buffer type.
+        2.  Parser to use references to data within the Buffer to avoid copies.
 
 III. Implementation Strategy:
 
-    A. Complete Rewrite:
+    A. Function Removal (Initial Step):
+        1.  Identify and remove functions that are redundant or replaced by the state machine.
+        2.  Focus on simplifying the codebase before starting the rewrite.
+        3.  Carefully evaluate the removal of high-performance extraction functions.
+    B. Complete Rewrite (State Machine):
         1.  Implement a new Parser struct with a clear state machine.
         2.  Create a Lexer struct for tokenization.
         3.  Use the provided memory management functions (memory_management.go).
-    B. Function Removal/Refactoring:
-        1.  Remove/refactor readValue, parseString, parseStringToBuffer, refillBuffer.
-        2.  Separate parsing and lexical analysis.
-    C. Memory Management:
+        4.  Use the buffer type as much as possible.
+    C. Extraction Function Integration:
+        1.  Explore integrating the existing optimized extraction logic (ExtractNumber, etc.) into the state machine.
+        2.  Design the state machine to call these functions directly when appropriate.
+        3.  Prioritize maintaining performance while ensuring correctness.
+    D. Memory Management:
         1.  Ensure all buffers and slices are pooled and returned.
         2.  Optimize buffer growth strategy.
-    D. Error Handling:
+    E. Error Handling:
         1.  Implement detailed error reporting with context.
         2.  Ensure proper error recovery within the state machine.
-    E. Performance:
+    F. Performance:
         1.  Maintain the goal of high performance and low allocation.
         2.  Benchmark and profile to identify and eliminate bottlenecks.
 
 IV. Next Steps:
 
-    A. Design the state transition table.
-    B. Implement the Lexer and Parser structs.
-    C. Implement the TokenHandler interface.
-    D. Test thoroughly with various JSON inputs.
+    A. Function Removal (First Action):
+        1.  Identify and remove unnecessary functions.
+    B. Design the state transition table.
+    C. Implement the Lexer and Parser structs.
+    D. Implement the TokenHandler interface.
+    E. Test thoroughly with various JSON inputs.
