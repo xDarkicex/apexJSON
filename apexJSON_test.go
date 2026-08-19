@@ -255,6 +255,19 @@ func BenchmarkGjsonExtractNestedValue(b *testing.B) {
 	}
 }
 
+// State Machine Parser specific benchmarks
+func BenchmarkApexGetNestedObject(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, _ = apexJSON.GetObject(complexJSON, "address")
+	}
+}
+
+func BenchmarkApexGetNestedArray(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, _ = apexJSON.GetArray(complexJSON, "tags")
+	}
+}
+
 // real world benchmarks
 type User struct {
 	ID        int       `json:"id"`
@@ -387,6 +400,19 @@ func BenchmarkApexUnmarshalComplexUser(b *testing.B) {
 	}
 }
 
+// Complex data extraction benchmarks
+func BenchmarkApexExtractNestedPath(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, _ = apexJSON.Extract(complexUserJSON, "posts", "0", "comments", "1", "content")
+	}
+}
+
+func BenchmarkApexGetNestedArray2(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, _ = apexJSON.GetArray(complexUserJSON, "posts", "0", "comments")
+	}
+}
+
 // jsoniter complex user benchmarks
 func BenchmarkJsoniterMarshalComplexUser(b *testing.B) {
 	for i := 0; i < b.N; i++ {
@@ -505,6 +531,41 @@ func TestProfileMarshalMemory(t *testing.T) {
 	err = pprof.WriteHeapProfile(afterF)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// State machine parser specific tests
+func TestStateMachineParserCorrectness(t *testing.T) {
+	// Test string handling
+	str, ok := apexJSON.Extract([]byte(`{"key":"value with \"escaped quotes\""}`), "key")
+	if !ok || string(str) != `"value with \"escaped quotes\""` {
+		t.Errorf("Failed to correctly handle escaped quotes in strings")
+	}
+
+	// Test nested structures - use safe type assertions
+	obj, ok := apexJSON.GetObject([]byte(`{"nested":{"a":1,"b":2}}`), "nested")
+	if !ok {
+		t.Errorf("Failed to get nested object")
+	} else {
+		a, aOk := obj["a"].(float64)
+		b, bOk := obj["b"].(float64)
+		if !aOk || a != 1 || !bOk || b != 2 {
+			t.Errorf("Failed to correctly parse nested object values: a=%v (ok=%v), b=%v (ok=%v)",
+				obj["a"], aOk, obj["b"], bOk)
+		}
+	}
+
+	// Test array handling - use safe type assertions
+	arr, ok := apexJSON.GetArray([]byte(`{"arr":[1,2,3]}`), "arr")
+	if !ok {
+		t.Errorf("Failed to get array")
+	} else if len(arr) != 3 {
+		t.Errorf("Array length incorrect, expected 3, got %d", len(arr))
+	} else {
+		val, valOk := arr[0].(float64)
+		if !valOk || val != 1 {
+			t.Errorf("First array element incorrect: %v (type assertion ok: %v)", arr[0], valOk)
+		}
 	}
 }
 

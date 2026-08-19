@@ -176,6 +176,12 @@ func putBuffer(buf *Buffer) {
 	if buf == nil || cap(buf.buf) > 65536 {
 		return
 	}
+
+	// Explicitly zero out the buffer to prevent data leakage
+	for i := range buf.buf {
+		buf.buf[i] = 0
+	}
+
 	buf.Reset()
 
 	// Use bitmask for size classification
@@ -439,32 +445,6 @@ func (b *Buffer) Bytes() []byte {
 	return b.buf[:b.off]
 }
 
-// Add this method to your Buffer type
-// func (b *Buffer) WriteString(s string) (int, error) {
-// 	// Pre-grow the buffer if needed
-// 	if b.off+len(s) > cap(b.buf) {
-// 		b.grow(len(s))
-// 	}
-
-//		// Copy the string directly into the buffer's slice
-//		n := copy(b.buf[b.off:], s)
-//		b.off += n
-//		return n, nil
-//	}
-// func (b *Buffer) WriteString(s string) (int, error) {
-// 	sLen := len(s)
-// 	if b.off+sLen > cap(b.buf) {
-// 		b.grow(sLen)
-// 	}
-
-// 	// Use a manual byte-by-byte copy to ensure data is written correctly
-// 	for i := 0; i < len(s); i++ {
-// 		b.buf[b.off+i] = s[i]
-// 	}
-
-//		b.off += sLen
-//		return sLen, nil
-//	}
 func (b *Buffer) WriteString(s string) (int, error) {
 	sLen := len(s)
 

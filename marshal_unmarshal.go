@@ -576,6 +576,56 @@ func marshalMap(v reflect.Value, buf *Buffer) error {
 	return nil
 }
 
+// marshalStruct serializes a struct to JSON with efficient memory usage
+func marshalStruct(v reflect.Value, buf *Buffer) error {
+	// Get cached fields for struct type
+	fields := getCachedFields(v.Type())
+
+	// Start object
+	buf.WriteByte(jsonOpenBrace)
+
+	// Track if we've written any fields yet
+	first := true
+
+	// Process each field
+	for _, f := range fields {
+		// Get the field value
+		fv := v.FieldByIndex(f.index)
+
+		// Skip zero values if omitEmpty is set
+		if f.omitEmpty && isEmptyValue(fv) {
+			continue
+		}
+
+		// Add comma if this isn't the first field
+		if !first {
+			buf.WriteByte(jsonComma)
+		}
+		first = false
+
+		// Write field name with quotes
+		if f.nameWithQuotesBytes != nil {
+			buf.Write(f.nameWithQuotesBytes)
+		} else {
+			buf.WriteByte(jsonQuote)
+			buf.Write(f.nameBytes)
+			buf.WriteByte(jsonQuote)
+		}
+
+		// Write colon
+		buf.WriteByte(':')
+
+		// Marshal the field value
+		if err := marshalValue(fv, buf); err != nil {
+			return err
+		}
+	}
+
+	// Close object
+	buf.WriteByte(jsonCloseBrace)
+	return nil
+}
+
 // Specialized implementations for common map types
 func marshalStringInterfaceMap(m map[string]interface{}, buf *Buffer) error {
 	buf.WriteByte(jsonOpenBrace)
@@ -715,350 +765,18 @@ func marshalStringIntMap(m map[string]int, buf *Buffer) error {
 	return nil
 }
 
-// marshalStruct serializes a struct to JSON with optimized memory usage
-func marshalStruct(v reflect.Value, buf *Buffer) error {
-	t := v.Type()
-	fields := structFields(t)
-
-	// Write opening brace
-	buf.WriteByte(jsonOpenBrace)
-
-	fieldCount := 0
-	// Process all fields with direct writing to buffer
-	for i := 0; i < len(fields); i++ {
-		f := &fields[i]
-		fv := v.FieldByIndex(f.index)
-
-		// Skip empty fields with omitempty tag
-		if f.omitEmpty && isEmptyValue(fv) {
-			continue
-		}
-
-		// Add comma if not the first field
-		if fieldCount > 0 {
-			buf.WriteByte(jsonComma)
-		}
-		fieldCount++
-
-		// Write field name
-		buf.Write(f.nameWithQuotesBytes)
-
-		// Special handling for string tag option
-		// This is strange if why have a switch case with only one case that matches basically everything?
-		if f.stringOpt {
-			switch fv.Kind() {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
-				reflect.Float32, reflect.Float64, reflect.Bool:
-				// For numeric types with string tag, wrap in quotes
-				buf.WriteByte(jsonQuote)
-				if err := marshalValue(fv, buf); err != nil {
-					return err
-				}
-				buf.WriteByte(jsonQuote)
-				continue
-			}
-		}
-
-		// Regular marshaling for all other cases
-		if err := marshalValue(fv, buf); err != nil {
-			return err
-		}
-	}
-
-	// Write closing brace
-	buf.WriteByte(jsonCloseBrace)
-	return nil
-}
-
-func unmarshalValue(p *Parser, v reflect.Value) error {
-	p.skipWhitespace()
-	if p.pos >= len(p.data) {
-		return &SyntaxError{Offset: int64(p.pos), Msg: "unexpected end of JSON input"}
-	}
-
+func unmarshalValue(data []byte, v reflect.Value) error {
+	// Check for custom unmarshaler first
 	if v.CanAddr() && v.Addr().Type().Implements(reflect.TypeOf((*Unmarshaler)(nil)).Elem()) {
-		start := p.pos
-		if !skipValue(p) {
-			return &SyntaxError{Offset: int64(p.pos), Msg: "invalid JSON value"}
-		}
-		return v.Addr().Interface().(Unmarshaler).UnmarshalJSON(p.data[start:p.pos])
+		return v.Addr().Interface().(Unmarshaler).UnmarshalJSON(data)
 	}
 
-	switch p.data[p.pos] {
-	case 'n':
-		p.pos += 4 // Skip "null"
-		return setNull(v)
-	case 't':
-		p.pos += 4 // Skip "true"
-		return setBool(v, true)
-	case 'f':
-		p.pos += 5 // Skip "false"
-		return setBool(v, false)
-	case '"':
-		tokenType, value := p.parseString()
-		if tokenType != TokenString {
-			return &SyntaxError{Offset: int64(p.pos), Msg: "invalid string"}
-		}
-		return setString(v, GetString(value))
-	case '{':
-		if v.Kind() == reflect.Struct {
-			return unmarshalToStruct(p, v)
-		} else if v.Kind() == reflect.Map {
-			return unmarshalToMap(p, v)
-		}
-	case '[':
-		if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {
-			return unmarshalToSlice(p, v)
-		}
-	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		tokenType, value := p.parseNumber()
-		if tokenType != TokenNumber {
-			return &SyntaxError{Offset: int64(p.pos), Msg: "invalid number"}
-		}
-		return setNumber(v, GetString(value), nil)
-	}
+	// Create unmarshal handler for the target value
+	handler := NewUnmarshalHandler(v, nil)
 
-	return &SyntaxError{Offset: int64(p.pos), Msg: "invalid JSON value"}
-}
+	// Create parser with the handler
+	parser := NewParser(handler)
 
-func unmarshalToMap(p *Parser, v reflect.Value) error {
-	// Skip opening brace
-	p.pos++
-
-	// Create map if nil
-	t := v.Type()
-	if v.IsNil() {
-		v.Set(reflect.MakeMap(t))
-	}
-
-	// Get key and element types
-	keyType := t.Key()
-	elemType := t.Elem()
-
-	// Process key-value pairs
-	for p.pos < len(p.data) {
-		p.skipWhitespace()
-
-		if p.pos >= len(p.data) {
-			err := getSyntaxError()
-			err.Offset = int64(p.pos)
-			err.Msg = "unexpected end of JSON input"
-			return err
-		}
-
-		// Check for end of object
-		if p.data[p.pos] == '}' {
-			p.pos++ // Skip closing brace
-			return nil
-		}
-
-		// Expect a comma between elements (but not before the first element)
-		if p.data[p.pos] == ',' {
-			p.pos++ // Skip comma
-			p.skipWhitespace()
-		}
-
-		// Parse key
-		tokenType, keyBytes := p.parseString()
-		if tokenType != TokenString {
-			err := getSyntaxError()
-			err.Offset = int64(p.pos)
-			err.Msg = "expected string key in object"
-			return err
-		}
-		keyStr := GetString(keyBytes)
-
-		// Expect colon
-		p.skipWhitespace()
-		if p.pos >= len(p.data) || p.data[p.pos] != ':' {
-			err := getSyntaxError()
-			err.Offset = int64(p.pos)
-			err.Msg = "expected colon after object key"
-			return err
-		}
-		p.pos++ // Skip colon
-
-		// Create map key
-		mapKey := reflect.New(keyType).Elem()
-		if err := setString(mapKey, keyStr); err != nil {
-			return &UnmarshalTypeError{Value: "string", Type: keyType, Offset: int64(p.pos)}
-		}
-
-		// Create map value
-		mapElem := reflect.New(elemType).Elem()
-
-		// Unmarshal value
-		if err := unmarshalValue(p, mapElem); err != nil {
-			return err
-		}
-
-		// Set map entry
-		v.SetMapIndex(mapKey, mapElem)
-	}
-
-	err := getSyntaxError()
-	err.Offset = int64(p.pos)
-	err.Msg = "unexpected end of JSON input"
-	return err
-}
-
-func unmarshalToStruct(p *Parser, v reflect.Value) error {
-	// Skip opening brace
-	p.pos++
-
-	// Get field information
-	fields := structFields(v.Type())
-	fieldMap := getFieldMap()
-	defer putFieldMap(fieldMap)
-
-	// Convert Field to field and populate the map
-	for _, f := range fields {
-		// Use GetString to convert nameBytes to string for map key
-		fieldName := GetString(f.nameBytes)
-		fieldMap[fieldName] = Field{
-			nameBytes:           f.nameBytes,
-			nameWithQuotesBytes: f.nameWithQuotesBytes,
-			index:               f.index,
-			omitEmpty:           f.omitEmpty,
-		}
-	}
-
-	// Process key-value pairs
-	for p.pos < len(p.data) {
-		p.skipWhitespace()
-		if p.pos >= len(p.data) {
-			return &SyntaxError{Offset: int64(p.pos), Msg: "unexpected end of JSON input"}
-		}
-
-		// Check for end of object
-		if p.data[p.pos] == '}' {
-			p.pos++ // Skip closing brace
-			return nil
-		}
-
-		// Expect a comma between elements (but not before the first element)
-		if p.data[p.pos] == ',' {
-			p.pos++ // Skip comma
-			p.skipWhitespace()
-		}
-
-		// Parse field name
-		tokenType, keyBytes := p.parseString()
-		if tokenType != TokenString {
-			return &SyntaxError{Offset: int64(p.pos), Msg: "expected string key in object"}
-		}
-
-		key := GetString(keyBytes)
-		// Expect colon
-		p.skipWhitespace()
-		if p.pos >= len(p.data) || p.data[p.pos] != ':' {
-			err := getSyntaxError()
-			err.Offset = int64(p.pos)
-			err.Msg = "expected colon after object key"
-			return err
-		}
-
-		p.pos++ // Skip colon
-		// Find matching field
-		f, ok := fieldMap[key]
-		if !ok {
-			// Skip value if field doesn't exist in struct
-			if !skipValue(p) {
-				err := getSyntaxError()
-				err.Offset = int64(p.pos)
-				err.Msg = "invalid JSON value"
-				return err
-			}
-
-			continue
-		}
-
-		// Unmarshal value into field
-		field := v.FieldByIndex(f.index)
-		if err := unmarshalValue(p, field); err != nil {
-			if ute, ok := err.(*UnmarshalTypeError); ok {
-				ute.Field = key
-			}
-
-			return err
-		}
-	}
-
-	err := getSyntaxError()
-	err.Offset = int64(p.pos)
-	err.Msg = "unexpected end of JSON input"
-	return err
-}
-
-func unmarshalToSlice(p *Parser, v reflect.Value) error {
-	// Skip opening bracket
-	p.pos++
-
-	// Get element type
-	t := v.Type()
-	elemType := t.Elem()
-
-	// For slices, create a new one; for arrays, use existing
-	isSlice := v.Kind() == reflect.Slice
-	if isSlice {
-		// Start with empty slice
-		v.Set(reflect.MakeSlice(t, 0, 4))
-	}
-
-	// Track array index
-	index := 0
-
-	// Process array elements
-	for p.pos < len(p.data) {
-		p.skipWhitespace()
-
-		if p.pos >= len(p.data) {
-			return &SyntaxError{Offset: int64(p.pos), Msg: "unexpected end of JSON input"}
-		}
-
-		// Check for end of array
-		if p.data[p.pos] == ']' {
-			p.pos++ // Skip closing bracket
-			return nil
-		}
-
-		// Expect a comma between elements (but not before the first element)
-		if index > 0 {
-			if p.data[p.pos] != ',' {
-				return &SyntaxError{Offset: int64(p.pos), Msg: "expected comma after array element"}
-			}
-			p.pos++ // Skip comma
-			p.skipWhitespace()
-		}
-
-		// For arrays, check if we've exceeded the length
-		if !isSlice && index >= v.Len() {
-			return &UnmarshalTypeError{Value: "array", Type: t, Offset: int64(p.pos)}
-		}
-
-		// Create element value
-		var elem reflect.Value
-		if isSlice {
-			// Grow slice
-			elem = reflect.New(elemType).Elem()
-		} else {
-			// Use array element
-			elem = v.Index(index)
-		}
-
-		// Unmarshal element
-		if err := unmarshalValue(p, elem); err != nil {
-			return err
-		}
-
-		// For slices, append the new element
-		if isSlice {
-			v.Set(reflect.Append(v, elem))
-		}
-
-		index++
-	}
-
-	return &SyntaxError{Offset: int64(p.pos), Msg: "unexpected end of JSON input"}
+	// Use the state machine to parse and populate the value
+	return parser.Parse(data)
 }

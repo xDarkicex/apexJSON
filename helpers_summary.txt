@@ -53,3 +53,6 @@ func isWhitespace(c byte) bool
 
 // isCompleteLiteral: Checks if string is complete JSON literal.
 func isCompleteLiteral(s string) bool
+
+// (InvalidUnmarshalError): Error type for invalid unmarshaling.
+func (e *InvalidUnmarshalError) Error() string

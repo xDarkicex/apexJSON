@@ -7,65 +7,6 @@ import (
 	"strconv"
 )
 
-// Token types
-const (
-	TokenError = iota
-	TokenObjectStart
-	TokenObjectEnd
-	TokenArrayStart
-	TokenArrayEnd
-	TokenString
-	TokenNumber
-	TokenBool
-	TokenNull
-	TokenColon
-	TokenComma
-)
-
-const hex = "0123456789abcdef"
-
-const (
-	FloatPrecision2     = "%.2f"
-	FloatPrecision3     = "%.3f"
-	FloatPrecision4     = "%.4f"
-	FloatGeneral        = "%g"
-	FloatScientificE    = "%e"
-	FloatScientificCapE = "%E"
-	IntFormat           = "%d"
-	IntHex              = "%x"  // Hexadecimal lowercase
-	IntHexUpper         = "%X"  // Hexadecimal uppercase
-	IntBinary           = "%b"  // Binary
-	IntOctal            = "%o"  // Octal
-	FloatComma          = "%'f" // With thousand separators (Go 1.23+)
-)
-
-var (
-	jsonQuoteColon   = []byte{'"', ':'}
-	jsonQuote        = []byte{'"'}[0]
-	jsonColon        = []byte{':', '"'}
-	jsonComma        = []byte{','}[0]
-	jsonTrue         = []byte("true")
-	jsonFalse        = []byte("false")
-	jsonNull         = []byte("null")
-	jsonOpenBrace    = []byte{'{'}[0]
-	jsonCloseBrace   = []byte{'}'}[0]
-	jsonOpenBracket  = []byte{'['}[0]
-	jsonCloseBracket = []byte{']'}[0]
-	jsonQuoteComma   = []byte{'"', ','}
-	jsonEmpty        = []byte("empty")
-	jsonHexPrefix    = []byte("0x")
-	jsonMapOpen      = []byte("map[")
-	jsonMapClose     = []byte("]")
-	jsonNewline      = []byte{'\n'}
-)
-var escapeMap = [256][]byte{
-	'"':  []byte(`\"`),
-	'\\': []byte(`\\`),
-	'\n': []byte(`\n`),
-	'\r': []byte(`\r`),
-	'\t': []byte(`\t`),
-}
-
 func (e *SyntaxError) Error() string {
 	b := getBuilder()
 	defer putBuilder(b)
@@ -91,7 +32,11 @@ func Marshal(v interface{}) ([]byte, error) {
 	buf := getBuffer()
 	defer putBuffer(buf)
 
-	if err := marshalValue(reflect.ValueOf(v), buf); err != nil {
+	// Create encoder
+	enc := NewEncoder(buf)
+
+	// Encode value
+	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
 
@@ -101,16 +46,19 @@ func Marshal(v interface{}) ([]byte, error) {
 	return result, nil
 }
 func Unmarshal(data []byte, v interface{}) error {
-	p := NewParser(data)
-	// should I defer p.Close()?
-	return unmarshalValue(p, reflect.ValueOf(v).Elem())
-}
-
-func NewParser(data []byte) *Parser {
-	return &Parser{
-		data: data,
-		pos:  0,
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return &InvalidUnmarshalError{reflect.TypeOf(v)}
 	}
+
+	// Create unmarshal handler
+	handler := NewUnmarshalHandler(rv.Elem(), nil)
+
+	// Create parser with handler
+	parser := NewParser(handler)
+
+	// Parse the input
+	return parser.Parse(data)
 }
 
 func NewEncoder(w io.Writer) *Encoder {
@@ -152,817 +100,728 @@ func (e *Encoder) Encode(v interface{}) error {
 	return nil
 }
 
-func (d *Decoder) Decode(v interface{}) error {
-	fmt.Printf("Decode called: buf len=%d, readPos=%d\n", len(d.buf), d.readPos)
-	// Skip any whitespace
-	if err := d.skipWhitespace(); err != nil {
-		if err == io.EOF {
-			return io.EOF
-		}
-		return err
-	}
-
-	// Create a parser from the buffer
-	value, err := d.readValue()
-	if err != nil {
-		return err
-	}
-
-	// Unmarshal the value
-	err = Unmarshal(value, v)
-
-	// Check if it's a pooled SyntaxError and return it to the pool
-	if syntaxErr, ok := err.(*SyntaxError); ok {
-		// Create a copy of the error information
-		errCopy := fmt.Errorf("json syntax error at offset %d: %s",
-			syntaxErr.Offset, syntaxErr.Msg)
-
-		// Return the original error to the pool
-		putSyntaxError(syntaxErr)
-
-		return errCopy
-	}
-
-	// For other error types, just return them directly
-	return err
-}
-
 func (e *Encoder) SetEscapeHTML(on bool) {
 	e.escapeHTML = on
 }
 
-// ValueType returns the type of the current JSON value
-func (p *Parser) ValueType() int {
-	p.skipWhitespace()
-	if p.pos >= len(p.data) {
-		return TokenError
-	}
-
-	switch p.data[p.pos] {
-	case '{':
-		return TokenObjectStart
-	case '}':
-		return TokenObjectEnd
-	case '[':
-		return TokenArrayStart
-	case ']':
-		return TokenArrayEnd
-	case '"':
-		return TokenString
-	case 't', 'f':
-		return TokenBool
-	case 'n':
-		return TokenNull
-	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		return TokenNumber
-	case ':':
-		return TokenColon
-	case ',':
-		return TokenComma
-	}
-
-	return TokenError
-}
-
-func (d *Decoder) Close() {
-	putTokenBuf(&d.tokenBuf)
-	d.tokenBuf = nil
-}
-
 // GetObject extracts a map from JSON at the specified path
 func GetObject(data []byte, path ...string) (map[string]interface{}, bool) {
+	// First use Extract to get the raw JSON at the path
 	value, ok := Extract(data, path...)
 	if !ok {
 		return nil, false
 	}
 
-	p := NewParser(value)
+	// Create specialized object collector
+	collector := NewObjectCollector()
+	defer collector.Close()
 
-	// Create a deferred error handler
-	var syntaxErr *SyntaxError = nil
-	defer func() {
-		if syntaxErr != nil {
-			putSyntaxError(syntaxErr)
-		}
-	}()
+	// Use our state machine parser
+	parser := NewParser(collector)
 
-	// Check if this is actually an object
-	if p.ValueType() != TokenObjectStart {
+	// Parse the extracted JSON
+	if err := parser.Parse(value); err != nil {
 		return nil, false
 	}
 
-	// Get map from pool
-	result := getObjectMap()
-
-	// Skip the opening brace
-	p.pos++
-
-	// Parse all key-value pairs
-	for {
-		p.skipWhitespace()
-
-		// Check for end of object
-		if p.pos >= len(p.data) || p.data[p.pos] == '}' {
-			p.pos++ // Skip closing brace
-			break
-		}
-
-		// Parse key
-		tokenType, keyBytes := p.parseString()
-		if tokenType != TokenString {
-			syntaxErr = getSyntaxError()
-			syntaxErr.Offset = int64(p.pos)
-			syntaxErr.Msg = "expected string key in object"
-			putObjectMap(result)
-			return nil, false
-		}
-
-		key := GetString(keyBytes)
-
-		// Skip colon
-		p.skipWhitespace()
-		if p.pos >= len(p.data) || p.data[p.pos] != ':' {
-			syntaxErr = getSyntaxError()
-			syntaxErr.Offset = int64(p.pos)
-			syntaxErr.Msg = "expected colon after object key"
-			putObjectMap(result)
-			return nil, false
-		}
-		p.pos++
-
-		// Parse value based on type
-		p.skipWhitespace()
-		switch p.ValueType() {
-		case TokenString:
-			if val, ok := p.ExtractString(); ok {
-				result[key] = val
-			}
-		case TokenNumber:
-			if val, ok := p.ExtractNumber(); ok {
-				result[key] = val
-			}
-		case TokenBool:
-			if val, ok := p.ExtractBool(); ok {
-				result[key] = val
-			}
-		case TokenNull:
-			p.matchLiteral("null")
-			result[key] = nil
-		case TokenObjectStart:
-			if obj, ok := GetObject(p.data[p.pos:], ""); ok {
-				result[key] = obj
-				// Skip the object we just parsed
-				depth := 1
-				p.pos++
-				for depth > 0 && p.pos < len(p.data) {
-					if p.data[p.pos] == '{' {
-						depth++
-					} else if p.data[p.pos] == '}' {
-						depth--
-					}
-					p.pos++
-				}
-			}
-		case TokenArrayStart:
-			if arr, ok := GetArray(p.data[p.pos:], ""); ok {
-				result[key] = arr
-				// Skip the array we just parsed
-				depth := 1
-				p.pos++
-				for depth > 0 && p.pos < len(p.data) {
-					if p.data[p.pos] == '[' {
-						depth++
-					} else if p.data[p.pos] == ']' {
-						depth--
-					}
-					p.pos++
-				}
-			}
-		}
-
-		// Skip comma or end of object
-		p.skipWhitespace()
-		if p.pos >= len(p.data) {
-			syntaxErr = getSyntaxError()
-			syntaxErr.Offset = int64(p.pos)
-			syntaxErr.Msg = "unexpected end of JSON input"
-			putObjectMap(result)
-			return nil, false
-		}
-
-		if p.data[p.pos] == '}' {
-			p.pos++ // Skip closing brace
-			break
-		}
-
-		if p.data[p.pos] != ',' {
-			syntaxErr = getSyntaxError()
-			syntaxErr.Offset = int64(p.pos)
-			syntaxErr.Msg = "expected comma after object property"
-			putObjectMap(result)
-			return nil, false
-		}
-
-		p.pos++ // Skip comma
-	}
-
-	// Create a new map to return - we can't return the pooled one directly
-	finalResult := make(map[string]interface{}, len(result))
-	for k, v := range result {
-		finalResult[k] = v
-	}
-
-	putObjectMap(result)
-	return finalResult, true
-}
-
-// skipWhitespace skips whitespace in the decoder's buffer
-func (d *Decoder) skipWhitespace() error {
-	for {
-		// Skip any whitespace in current buffer
-		for d.readPos < len(d.buf) {
-			c := d.buf[d.readPos]
-			if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
-				return nil
-			}
-			d.readPos++
-		}
-
-		// Need more data - use refillBuffer instead of direct read
-		if err := d.refillBuffer(); err != nil {
-			if err == io.EOF {
-				return err
-			}
-			return err
-		}
-
-		// If buffer is still empty after refill, we're done
-		if len(d.buf) == 0 {
-			return io.EOF
-		}
-	}
-}
-
-func (d *Decoder) UseNumber() *Decoder {
-	d.useNumber = true
-	return d
-}
-
-func (d *Decoder) readValue() ([]byte, error) {
-	// Get a fresh token buffer from the pool
-	oldBuf := d.tokenBuf
-	d.tokenBuf = *getTokenBuf()
-	defer func() {
-		// Always return the buffer to the pool if we exit early
-		if &d.tokenBuf != &oldBuf {
-			putTokenBuf(&d.tokenBuf)
-		}
-	}()
-
-	// Make sure we have data to read
-	if len(d.buf) == 0 || d.readPos >= len(d.buf) {
-		if err := d.refillBuffer(); err != nil {
-			d.tokenBuf = oldBuf
-			return nil, err
-		}
-	}
-
-	// Track parsing state
-	depth := 0
-	inString := false
-	escaped := false
-	buffers := make([][]byte, 0, 4)
-
-	// Record first character for validation
-	firstChar := d.buf[d.readPos]
-
-	// Skip initial whitespace
-	for d.readPos < len(d.buf) && isWhitespace(d.buf[d.readPos]) {
-		d.readPos++
-		if d.readPos >= len(d.buf) {
-			if err := d.refillBuffer(); err != nil {
-				d.tokenBuf = oldBuf
-				return nil, err
-			}
-		}
-	}
-
-	// Ensure we have non-whitespace data
-	if d.readPos >= len(d.buf) {
-		d.tokenBuf = oldBuf
-		return nil, io.EOF
-	}
-
-	// Main parsing loop
-	for {
-		// Ensure we have data
-		if d.readPos >= len(d.buf) {
-			if err := d.refillBuffer(); err != nil {
-				if err == io.EOF && len(d.tokenBuf) > 0 {
-					// We have a partial value but no more data
-					if depth > 0 {
-						// Unclosed object or array
-						d.tokenBuf = oldBuf
-						return nil, fmt.Errorf("unexpected end of JSON input: unclosed structure")
-					}
-
-					// Return what we have if it makes sense as a complete value
-					tokenStr := string(d.tokenBuf)
-					if isCompleteLiteral(tokenStr) {
-						result := AppendBuffers(append(buffers, d.tokenBuf))
-						d.tokenBuf = oldBuf
-						return result, nil
-					} else if len(d.tokenBuf) >= 2 &&
-						((d.tokenBuf[0] == '{' && d.tokenBuf[len(d.tokenBuf)-1] == '}') ||
-							(d.tokenBuf[0] == '[' && d.tokenBuf[len(d.tokenBuf)-1] == ']')) {
-						result := AppendBuffers(append(buffers, d.tokenBuf))
-						d.tokenBuf = oldBuf
-						return result, nil
-					}
-				}
-
-				d.tokenBuf = oldBuf
-				return nil, err
-			}
-		}
-
-		// Process the current character
-		c := d.buf[d.readPos]
-		d.tokenBuf = append(d.tokenBuf, c)
-		d.readPos++
-
-		// Handle string context
-		if inString {
-			if escaped {
-				escaped = false
-			} else if c == '\\' {
-				escaped = true
-			} else if c == '"' {
-				inString = false
-
-				// If we're at the top level and this is a standalone string, we're done
-				if depth == 0 && firstChar == '"' {
-					result := AppendBuffers(append(buffers, d.tokenBuf))
-					d.tokenBuf = oldBuf
-					return result, nil
-				}
-			}
-			continue // Skip other processing for string content
-		}
-
-		// Handle structural elements and literals when not in a string
-		switch c {
-		case '"':
-			inString = true
-
-		case '{', '[':
-			depth++
-
-		case '}', ']':
-			depth--
-
-			// If we've closed the outermost structure, we're done
-			if depth == 0 {
-				// Ensure brackets match: { must close with }, [ with ]
-				isValid := (firstChar == '{' && c == '}') || (firstChar == '[' && c == ']')
-				if !isValid {
-					d.tokenBuf = oldBuf
-					return nil, fmt.Errorf("mismatched brackets in JSON")
-				}
-
-				result := AppendBuffers(append(buffers, d.tokenBuf))
-				d.tokenBuf = oldBuf
-				return result, nil
-			} else if depth < 0 {
-				// This means we have an extra closing brace/bracket
-				d.tokenBuf = oldBuf
-				return nil, fmt.Errorf("unexpected closing character in JSON")
-			}
-
-		case ' ', '\t', '\r', '\n':
-			// Whitespace terminates top-level literals (but not nested ones)
-			if depth == 0 && firstChar != '{' && firstChar != '[' && firstChar != '"' {
-				// Check if we have a complete literal (excluding this whitespace)
-				tokenLen := len(d.tokenBuf)
-				valueBytes := d.tokenBuf[:tokenLen-1] // Exclude the whitespace
-
-				if isCompleteLiteral(string(valueBytes)) {
-					result := AppendBuffers(append(buffers, valueBytes))
-					d.tokenBuf = oldBuf
-					// Adjust read position back by one since we didn't consume this whitespace
-					d.readPos--
-					return result, nil
-				}
-			}
-
-		case ',', ':':
-			// These characters are only valid inside objects/arrays
-			if depth == 0 {
-				d.tokenBuf = oldBuf
-				return nil, fmt.Errorf("unexpected character in JSON literal: %c", c)
-			}
-		}
-
-		// If the current token buffer is getting large, add it to buffers and get a new one
-		if len(d.tokenBuf) >= 4096 {
-			// Create a copy to avoid buffer modification issues
-			tokenCopy := make([]byte, len(d.tokenBuf))
-			copy(tokenCopy, d.tokenBuf)
-			buffers = append(buffers, tokenCopy)
-
-			putTokenBuf(&d.tokenBuf)
-			d.tokenBuf = *getTokenBuf()
-		}
-	}
-}
-
-// Helper function to refill the buffer
-func (d *Decoder) refillBuffer() error {
-	// Use a smaller fixed size instead of full capacity
-	fmt.Printf("refillBuffer: attempting to read with buf cap=%d\n", cap(d.buf))
-	temp := make([]byte, 512) // Or even smaller like 128
-	n, err := d.r.Read(temp)
-	fmt.Printf("refillBuffer: read %d bytes, err=%v\n", n, err)
-	if n > 0 {
-		fmt.Printf("refillBuffer: first byte=%d (%c)\n", temp[0], temp[0])
-	}
-	// Handle EOF with data case explicitly
-	if err == io.EOF && n > 0 {
-		err = nil // EOF with data is not an error for us
-	}
-
-	if n > 0 {
-		// Append to existing buffer if needed
-		d.buf = append(d.buf, temp[:n]...)
-		// Or replace if empty: d.buf = temp[:n]
-	}
-
-	if err != nil && err != io.EOF {
-		return err
-	}
-
-	d.readPos = 0
-	return nil
+	// Get results from collector
+	return collector.Result()
 }
 
 // ### Extraction ###
 
-// Extract retrieves a value from JSON based on a path
-func Extract(data []byte, path ...string) ([]byte, bool) {
-	if len(path) == 0 {
-		return data, true
-	}
-
-	p := NewParser(data)
-
-	// Create a deferred error handler
-	var syntaxErr *SyntaxError = nil
-	defer func() {
-		if syntaxErr != nil {
-			putSyntaxError(syntaxErr)
-		}
-	}()
-
-	// Skip initial whitespace
-	p.skipWhitespace()
-
-	// Handle the root path segment
-	for _, segment := range path {
-		p.skipWhitespace()
-
-		if p.pos >= len(p.data) {
-			syntaxErr = getSyntaxError()
-			syntaxErr.Offset = int64(p.pos)
-			syntaxErr.Msg = "unexpected end of JSON input"
-			return nil, false
-		}
-
-		// Must be an object to extract by key
-		if p.data[p.pos] != '{' {
-			// Not a syntax error, just wrong path
-			return nil, false
-		}
-
-		p.pos++ // Skip '{'
-
-		found := false
-		for {
-			p.skipWhitespace()
-
-			if p.pos >= len(p.data) {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "unexpected end of JSON input"
-				return nil, false
-			}
-
-			// Check for end of object
-			if p.data[p.pos] == '}' {
-				return nil, false // Key not found - not a syntax error
-			}
-
-			// Parse key
-			tokenType, keyBytes := p.parseString()
-			if tokenType != TokenString {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "expected string key in object"
-				return nil, false
-			}
-
-			// Check if this is the key we want
-			key := GetString(keyBytes)
-
-			// Skip colon
-			p.skipWhitespace()
-			if p.pos >= len(p.data) || p.data[p.pos] != ':' {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "expected colon after object key"
-				return nil, false
-			}
-			p.pos++ // Skip colon
-
-			if key == segment {
-				// Found our key
-				found = true
-				break
-			}
-
-			// Skip value
-			if !skipValue(p) {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid JSON value"
-				return nil, false
-			}
-
-			// Skip comma or end of object
-			p.skipWhitespace()
-			if p.pos >= len(p.data) {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "unexpected end of JSON input"
-				return nil, false
-			}
-
-			if p.data[p.pos] == '}' {
-				return nil, false // Key not found - not a syntax error
-			}
-
-			if p.data[p.pos] != ',' {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "expected comma after object property"
-				return nil, false
-			}
-
-			p.pos++ // Skip comma
-		}
-
-		if !found {
-			return nil, false // Not a syntax error
-		}
-
-		// If this is the last segment, extract the value
-		if len(path) == 1 {
-			p.skipWhitespace()
-			start := p.pos
-			if !skipValue(p) {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid JSON value"
-				return nil, false
-			}
-			return p.data[start:p.pos], true
-		}
-
-		// Otherwise, continue with the next path segment
-		path = path[1:]
-	}
-
-	return nil, false
-}
-
 // GetArray extracts an array from JSON at the specified path
 func GetArray(data []byte, path ...string) ([]interface{}, bool) {
+	// First use Extract to get the raw JSON at the path
 	value, ok := Extract(data, path...)
 	if !ok {
 		return nil, false
 	}
 
-	p := NewParser(value)
+	// Create specialized array collector
+	collector := NewArrayCollector()
+	defer collector.Close()
 
-	// Create a deferred error handler
-	var syntaxErr *SyntaxError = nil
-	defer func() {
-		if syntaxErr != nil {
-			putSyntaxError(syntaxErr)
-		}
-	}()
+	// Use our state machine parser
+	parser := NewParser(collector)
 
-	// Check if this is actually an array
-	if p.ValueType() != TokenArrayStart {
+	// Parse the extracted JSON
+	if err := parser.Parse(value); err != nil {
 		return nil, false
 	}
 
-	// Get slice from pool
-	result := getArraySlice()
+	// Get results from collector
+	return collector.Result()
+}
 
-	// Skip opening bracket
-	p.pos++
+func NewArrayCollector() *ArrayCollector {
+	return &ArrayCollector{
+		result:     getArraySlice(), // From arraySlicePool
+		objStack:   make([]map[string]interface{}, 0, 8),
+		arrayStack: make([][]interface{}, 0, 8),
+	}
+}
 
-	// Parse array elements
-	for {
-		p.skipWhitespace()
-
-		// Check for end of array
-		if p.pos >= len(p.data) || p.data[p.pos] == ']' {
-			p.pos++ // Skip closing bracket
-			break
-		}
-
-		// Expect comma between elements (but not before first element)
-		if len(result) > 0 {
-			if p.data[p.pos] != ',' {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "expected comma after array element"
-				putArraySlice(result)
-				return nil, false
-			}
-			p.pos++ // Skip comma
-			p.skipWhitespace()
-		}
-
-		// Parse value based on type
-		switch p.ValueType() {
-		case TokenString:
-			if val, ok := p.ExtractString(); ok {
-				result = append(result, val)
-			} else {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid string in array"
-				putArraySlice(result)
-				return nil, false
-			}
-		case TokenNumber:
-			if val, ok := p.ExtractNumber(); ok {
-				result = append(result, val)
-			} else {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid number in array"
-				putArraySlice(result)
-				return nil, false
-			}
-		case TokenBool:
-			if val, ok := p.ExtractBool(); ok {
-				result = append(result, val)
-			} else {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid boolean in array"
-				putArraySlice(result)
-				return nil, false
-			}
-		case TokenNull:
-			if p.matchLiteral("null") {
-				result = append(result, nil)
-			} else {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid null in array"
-				putArraySlice(result)
-				return nil, false
-			}
-		case TokenObjectStart:
-			if obj, ok := GetObject(p.data[p.pos:], ""); ok {
-				result = append(result, obj)
-				// Skip the object we just parsed
-				depth := 1
-				p.pos++
-				for depth > 0 && p.pos < len(p.data) {
-					if p.data[p.pos] == '{' {
-						depth++
-					} else if p.data[p.pos] == '}' {
-						depth--
-					}
-					p.pos++
-				}
-			} else {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid object in array"
-				putArraySlice(result)
-				return nil, false
-			}
-		case TokenArrayStart:
-			if arr, ok := GetArray(p.data[p.pos:], ""); ok {
-				result = append(result, arr)
-				// Skip the array we just parsed
-				depth := 1
-				p.pos++
-				for depth > 0 && p.pos < len(p.data) {
-					if p.data[p.pos] == '[' {
-						depth++
-					} else if p.data[p.pos] == ']' {
-						depth--
-					}
-					p.pos++
-				}
-			} else {
-				syntaxErr = getSyntaxError()
-				syntaxErr.Offset = int64(p.pos)
-				syntaxErr.Msg = "invalid array in array"
-				putArraySlice(result)
-				return nil, false
-			}
-		default:
-			syntaxErr = getSyntaxError()
-			syntaxErr.Offset = int64(p.pos)
-			syntaxErr.Msg = "invalid JSON value in array"
-			putArraySlice(result)
-			return nil, false
+// Close releases resources back to pools
+func (h *ArrayCollector) Close() {
+	// Release any pooled resources
+	for _, obj := range h.objStack {
+		if obj != nil {
+			putObjectMap(obj)
 		}
 	}
 
-	// Create a new slice to return - we can't return the pooled one directly
-	finalResult := make([]interface{}, len(result))
-	copy(finalResult, result)
+	for _, arr := range h.arrayStack {
+		if arr != nil {
+			putArraySlice(arr)
+		}
+	}
+}
 
-	// Return the slice to the pool
-	putArraySlice(result)
+// Result returns the collected array
+func (h *ArrayCollector) Result() ([]interface{}, bool) {
+	if !h.inArray {
+		putArraySlice(h.result)
+		return nil, false
+	}
 
+	// Create a copy to return (can't return pooled slice directly)
+	finalResult := make([]interface{}, len(h.result))
+	copy(finalResult, h.result)
+
+	// Return pooled slice
+	putArraySlice(h.result)
 	return finalResult, true
 }
 
-func structFields(t reflect.Type) []Field {
-	return getCachedFields(t)
+// Fix for ArrayCollector.OnArrayStart()
+func (h *ArrayCollector) OnArrayStart() {
+	h.depth++
+
+	// If we haven't found the target array yet, this is it
+	if !h.inArray {
+		h.inArray = true
+		return
+	}
+
+	// Create a new array for nesting
+	arr := getArraySlice()
+	h.arrayStack = append(h.arrayStack, arr)
+}
+func (h *ArrayCollector) OnArrayEnd() {
+	// Root array completion
+	if h.depth == 1 {
+		h.depth--
+		return
+	}
+
+	// Process nested array completion
+	if len(h.arrayStack) > 0 {
+		arr := h.arrayStack[len(h.arrayStack)-1]
+		h.arrayStack = h.arrayStack[:len(h.arrayStack)-1]
+
+		// Create copy of array values
+		arrCopy := make([]interface{}, len(arr))
+		copy(arrCopy, arr)
+
+		// Add to parent container
+		h.addValueToContainer(arrCopy)
+		putArraySlice(arr)
+	}
+
+	h.depth--
 }
 
-// Contains reports whether the tag options contain the specified option
-//
-//go:inline
-func (o tagOptions) Contains(option string) bool {
-	if len(o) == 0 {
-		return false
+// addValueToContainer adds a value to the current container (array or object)
+func (h *ArrayCollector) addValueToContainer(value interface{}) {
+	// Check if we are in the root array
+	if h.inArray {
+		h.result = append(h.result, value)
+		return
 	}
 
-	optLen := len(option)
-	if optLen == 0 {
-		return false
+	// Handle nested objects
+	if len(h.objStack) > 0 {
+		currentObj := h.objStack[len(h.objStack)-1]
+		currentObj[h.currentKey] = value
+		return
 	}
 
-	s := string(o)
-	sLen := len(s)
-
-	// Check if this is exactly the option
-	if s == option {
-		return true
+	// Handle nested arrays
+	if len(h.arrayStack) > 0 {
+		currentArray := h.arrayStack[len(h.arrayStack)-1]
+		h.arrayStack[len(h.arrayStack)-1] = append(currentArray, value)
 	}
-
-	i := 0
-	for i < sLen {
-		// Find the start of the next option
-		start := i
-
-		// Find the end of the current option (comma or end of string)
-		for i < sLen && s[i] != ',' {
-			i++
-		}
-
-		// Check if this segment matches our option
-		if i-start == optLen && s[start:i] == option {
-			return true
-		}
-
-		// Skip the comma
-		if i < sLen {
-			i++
-		}
-	}
-
-	return false
 }
 
-// parseTag splits a struct field's json tag into its name and options
-//
-//go:inline
-func parseTag(tag string) (string, tagOptions) {
-	if len(tag) == 0 {
-		return "", ""
+// OnObjectStart handles the start of a JSON object
+func (h *ArrayCollector) OnObjectStart() {
+	h.depth++
+
+	// Create a new object from pool
+	obj := getObjectMap()
+	h.objStack = append(h.objStack, obj)
+}
+
+// OnObjectEnd handles the end of a JSON object
+func (h *ArrayCollector) OnObjectEnd() {
+	if len(h.objStack) > 0 {
+		// Get the completed object
+		obj := h.objStack[len(h.objStack)-1]
+		h.objStack = h.objStack[:len(h.objStack)-1]
+
+		// Create a copy (can't return pooled map directly)
+		objCopy := make(map[string]interface{}, len(obj))
+		for k, v := range obj {
+			objCopy[k] = v
+		}
+
+		// Add to parent container
+		h.addValueToContainer(objCopy)
+
+		// Return to pool
+		putObjectMap(obj)
 	}
 
-	// Manually search for the first comma
-	for i := 0; i < len(tag); i++ {
-		if tag[i] == ',' {
-			// Return slices of the original string instead of creating new ones
-			return tag[:i], tagOptions(tag[i+1:])
+	h.depth--
+}
+
+// OnObjectKey handles object keys
+func (h *ArrayCollector) OnObjectKey(key string) {
+	h.currentKey = key
+}
+
+// OnString handles string values
+func (h *ArrayCollector) OnString(value string) {
+	h.addValueToContainer(value)
+}
+
+// OnNumber handles numeric values
+func (h *ArrayCollector) OnNumber(value float64) {
+	h.addValueToContainer(value)
+}
+
+// OnBool handles boolean values
+func (h *ArrayCollector) OnBool(value bool) {
+	h.addValueToContainer(value)
+}
+
+// OnNull handles null values
+func (h *ArrayCollector) OnNull() {
+	h.addValueToContainer(nil)
+}
+
+func NewObjectCollector() *ObjectCollector {
+	result := getObjectMap()
+	// Verify map is empty
+	if len(result) > 0 {
+		// Map from pool wasn't reset, create a new one
+		fmt.Printf("WARNING: Object map from pool not empty, creating new\n")
+		result = make(map[string]interface{})
+	}
+
+	return &ObjectCollector{
+		result:     result,
+		objStack:   make([]map[string]interface{}, 0, 8),
+		arrayStack: make([][]interface{}, 0, 8),
+	}
+}
+
+// Close releases resources back to pools
+func (h *ObjectCollector) Close() {
+	// Release any pooled resources
+	for _, obj := range h.objStack {
+		if obj != nil {
+			putObjectMap(obj)
 		}
 	}
 
-	// No comma found, return the whole tag as the name
-	return tag, ""
+	for _, arr := range h.arrayStack {
+		if arr != nil {
+			putArraySlice(arr)
+		}
+	}
+}
+
+// Result returns the collected object with deep copying
+func (h *ObjectCollector) Result() (map[string]interface{}, bool) {
+	if !h.inObject {
+		putObjectMap(h.result)
+		return nil, false
+	}
+
+	// Create a copy to return (can't return pooled map directly)
+	finalResult := make(map[string]interface{}, len(h.result))
+
+	fmt.Printf("ObjectCollector.Result: Creating result map with %d entries\n", len(h.result))
+
+	// Log all keys to verify uniqueness
+	fmt.Printf("ObjectCollector.Result: Keys in map: ")
+	for k := range h.result {
+		fmt.Printf("%q ", k)
+	}
+	fmt.Println()
+
+	// Use a key isolation approach to prevent reference issues
+	for k, v := range h.result {
+		// Create a new string for the key to break any reference issues
+		newKey := string([]byte(k))
+
+		fmt.Printf("ObjectCollector.Result: Copying key=%q, value=%v\n", newKey, v)
+
+		// Deep copy the value
+		copiedValue := deepCopyValue(v)
+
+		// Store with the new key
+		finalResult[newKey] = copiedValue
+
+		fmt.Printf("ObjectCollector.Result: After copy, finalResult[%q]=%v\n", newKey, finalResult[newKey])
+	}
+
+	// Verify final map has all entries
+	fmt.Printf("ObjectCollector.Result: Final map has %d entries\n", len(finalResult))
+
+	// Return pooled map to the pool AFTER we're done with it
+	putObjectMap(h.result)
+	return finalResult, true
+}
+
+// Fix for the nested object property access
+func deepCopyValue(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+
+	switch val := v.(type) {
+	case string:
+		// Always create a new string from bytes to ensure memory isolation
+		return string([]byte(val))
+	case map[string]interface{}:
+		newMap := make(map[string]interface{}, len(val))
+		for k, v := range val {
+			// Isolate both keys and values
+			newKey := string([]byte(k))
+			newMap[newKey] = deepCopyValue(v)
+		}
+		return newMap
+	case []interface{}:
+		newSlice := make([]interface{}, len(val))
+		for i, v := range val {
+			newSlice[i] = deepCopyValue(v)
+		}
+		return newSlice
+	case Number:
+		return val
+	case float64:
+		// Return float64 directly - this is the standard JSON number type
+		return val
+	case int:
+		// Convert int to float64 for JSON consistency
+		return float64(val)
+	case int64:
+		// Convert int64 to float64 for JSON consistency
+		return float64(val)
+	default:
+		// String, bool, etc.
+		return val
+	}
+}
+
+func (h *ObjectCollector) OnComma() {
+	fmt.Printf("ObjectCollector.OnComma: depth=%d\n", h.depth)
+	// No special logic needed for object collectors
+}
+
+// OnObjectStart handles the start of a JSON object
+func (h *ObjectCollector) OnObjectStart() {
+	fmt.Printf("ObjectCollector.OnObjectStart: depth=%d, inObject=%v, objStack=%d\n",
+		h.depth, h.inObject, len(h.objStack))
+
+	h.depth++
+
+	// If we haven't found the target object yet, this is it
+	if !h.inObject {
+		h.inObject = true
+		fmt.Printf("ObjectCollector.OnObjectStart: Root object found, setting inObject=true\n")
+		return
+	}
+
+	// Create a new object for nesting
+	obj := getObjectMap()
+	fmt.Printf("ObjectCollector.OnObjectStart: Creating nested object, stack size before=%d\n",
+		len(h.objStack))
+	h.objStack = append(h.objStack, obj)
+	fmt.Printf("ObjectCollector.OnObjectStart: Stack size after=%d\n", len(h.objStack))
+
+	fmt.Printf("ObjectCollector.OnObjectStart (after): depth=%d, inObject=%v, objStack=%d\n",
+		h.depth, h.inObject, len(h.objStack))
+}
+
+// OnObjectEnd handles closing of object
+func (h *ObjectCollector) OnObjectEnd() {
+	fmt.Printf("ObjectCollector.OnObjectEnd: depth=%d, inObject=%v, objStack=%d\n",
+		h.depth, h.inObject, len(h.objStack))
+
+	// Root object completion
+	if h.depth == 1 {
+		fmt.Printf("ObjectCollector.OnObjectEnd: Root object complete\n")
+		h.depth--
+		return
+	}
+
+	// Process nested object completion
+	if len(h.objStack) > 0 {
+		obj := h.objStack[len(h.objStack)-1]
+		h.objStack = h.objStack[:len(h.objStack)-1]
+
+		// Create copy of object
+		objCopy := make(map[string]interface{}, len(obj))
+		for k, v := range obj {
+			objCopy[k] = v
+			fmt.Printf("ObjectCollector.OnObjectEnd: Copied key-value: %s=%v\n", k, v)
+		}
+
+		// Add to parent container
+		fmt.Printf("ObjectCollector.OnObjectEnd: Adding completed object to parent, currentKey=%s\n",
+			h.currentKey)
+		h.addValueToContainer(objCopy)
+		putObjectMap(obj)
+	} else {
+		fmt.Printf("ObjectCollector.OnObjectEnd: WARNING - No object on stack to close!\n")
+	}
+
+	h.depth--
+	fmt.Printf("ObjectCollector.OnObjectEnd (after): depth=%d, inObject=%v, objStack=%d\n",
+		h.depth, h.inObject, len(h.objStack))
+}
+
+// OnObjectKey handles object keys
+func (h *ObjectCollector) OnObjectKey(key string) {
+	// Create a new string copy to prevent reference issues
+	h.currentKey = SafeString(key)
+	fmt.Printf("ObjectCollector.OnObjectKey: key=%q, depth=%d, inObject=%v, objStack=%d\n",
+		key, h.depth, h.inObject, len(h.objStack))
+	fmt.Printf("ObjectCollector.OnObjectKey (after): currentKey=%q\n", h.currentKey)
+}
+
+// OnArrayStart handles start of JSON array
+func (h *ObjectCollector) OnArrayStart() {
+	fmt.Printf("ObjectCollector.OnArrayStart: depth=%d, currentKey=%q\n", h.depth, h.currentKey)
+
+	// Create a new array for nesting
+	arr := getArraySlice()
+	fmt.Printf("ObjectCollector.OnArrayStart: Creating array, stack size before=%d\n",
+		len(h.arrayStack))
+	h.arrayStack = append(h.arrayStack, arr)
+	fmt.Printf("ObjectCollector.OnArrayStart: Stack size after=%d\n", len(h.arrayStack))
+}
+
+func (h *ObjectCollector) OnArrayEnd() {
+	fmt.Printf("ObjectCollector.OnArrayEnd: depth=%d, arrayStack=%d\n",
+		h.depth, len(h.arrayStack))
+
+	// Process array completion
+	if len(h.arrayStack) > 0 {
+		arr := h.arrayStack[len(h.arrayStack)-1]
+		h.arrayStack = h.arrayStack[:len(h.arrayStack)-1]
+
+		// Create copy of array values
+		arrCopy := make([]interface{}, len(arr))
+		copy(arrCopy, arr)
+
+		// Add to parent container
+		fmt.Printf("ObjectCollector.OnArrayEnd: Adding completed array to parent, currentKey=%s\n",
+			h.currentKey)
+		h.addValueToContainer(arrCopy)
+		putArraySlice(arr)
+	} else {
+		fmt.Printf("ObjectCollector.OnArrayEnd: WARNING - No array on stack to close!\n")
+	}
+
+	fmt.Printf("ObjectCollector.OnArrayEnd (after): arrayStack=%d\n", len(h.arrayStack))
+}
+
+func (h *ObjectCollector) OnString(value string) {
+	safeValue := SafeString(value)
+	h.addValueToContainer(safeValue)
+}
+
+// OnNumber handles numeric values
+func (h *ObjectCollector) OnNumber(value float64) {
+	h.addValueToContainer(value)
+}
+
+// OnBool handles boolean values
+func (h *ObjectCollector) OnBool(value bool) {
+	fmt.Printf("ObjectCollector.OnBool: value=%v, currentKey=%q\n", value, h.currentKey)
+	h.addValueToContainer(value)
+}
+
+// OnNull handles null values
+func (h *ObjectCollector) OnNull() {
+	fmt.Printf("ObjectCollector.OnNull: currentKey=%q\n", h.currentKey)
+	h.addValueToContainer(nil)
+}
+
+// addValueToContainer adds a value to the current container (object or array)
+func (h *ObjectCollector) addValueToContainer(value interface{}) {
+	// Create a unique copy of the key to prevent reference sharing and corruption
+	keyCopy := SafeString(h.currentKey)
+
+	fmt.Printf("ObjectCollector.addValueToContainer: key=%q, value=%v, inObject=%v, objStack=%d, arrayStack=%d\n",
+		keyCopy, value, h.inObject, len(h.objStack), len(h.arrayStack))
+
+	// Add safety check for edge cases
+	if !h.inObject && len(h.objStack) == 0 && len(h.arrayStack) == 0 {
+		fmt.Printf("WARNING: Value not added to any container: %v\n", value)
+		// Fix: If we're at the root level but inObject isn't set, set it now
+		h.inObject = true
+		fmt.Printf("ObjectCollector.addValueToContainer: Fixed - set inObject=true\n")
+	}
+
+	// Check if we are in the root object - now correctly checks depth
+	if h.inObject && h.depth == 1 {
+		fmt.Printf("ObjectCollector.addValueToContainer: Adding to root object: %s=%v\n",
+			keyCopy, value)
+		h.result[keyCopy] = value
+		return
+	}
+
+	// Handle nested objects
+	if len(h.objStack) > 0 {
+		currentObj := h.objStack[len(h.objStack)-1]
+		fmt.Printf("ObjectCollector.addValueToContainer: Adding to nested object: %s=%v\n",
+			keyCopy, value)
+		currentObj[keyCopy] = value
+		return
+	}
+
+	// Handle nested arrays
+	if len(h.arrayStack) > 0 {
+		currentArray := h.arrayStack[len(h.arrayStack)-1]
+		fmt.Printf("ObjectCollector.addValueToContainer: Adding to array: %v\n", value)
+		h.arrayStack[len(h.arrayStack)-1] = append(currentArray, value)
+		return
+	}
+
+	// Fix for when we're processing a top-level object but depth tracking had issues
+	if h.inObject {
+		fmt.Printf("ObjectCollector.addValueToContainer: Adding to root as fallback: %s=%v\n",
+			keyCopy, value)
+		h.result[keyCopy] = value
+		return
+	}
+
+	fmt.Printf("ObjectCollector.addValueToContainer: WARNING - Value not added: %v\n", value)
+}
+
+func NewUnmarshalHandler(v reflect.Value, dec *Decoder) *UnmarshalHandler {
+	return &UnmarshalHandler{
+		target:     v,
+		keyStack:   make([]string, 0, 8),
+		valueStack: make([]reflect.Value, 0, 8),
+		decoder:    dec,
+	}
+}
+
+// OnObjectStart implements TokenHandler interface
+func (h *UnmarshalHandler) OnObjectStart() {
+	// Create or push appropriate container based on current value
+	if len(h.valueStack) > 0 {
+		current := h.valueStack[len(h.valueStack)-1]
+		var newVal reflect.Value
+
+		switch current.Kind() {
+		case reflect.Map:
+			if current.IsNil() {
+				current.Set(reflect.MakeMap(current.Type()))
+			}
+			newVal = current
+		case reflect.Interface:
+			mapType := reflect.TypeOf(map[string]interface{}{})
+			newMap := reflect.MakeMap(mapType)
+			newVal = newMap
+		case reflect.Struct:
+			newVal = current
+		default:
+			newVal = reflect.Value{}
+		}
+
+		// Only push for nested values
+		if current.Kind() != reflect.Struct {
+			h.valueStack = append(h.valueStack, newVal)
+		}
+	} else {
+		// Root level - use target
+		h.valueStack = append(h.valueStack, h.target)
+	}
+}
+
+// Implement other TokenHandler methods
+func (h *UnmarshalHandler) OnObjectEnd() {
+	if len(h.valueStack) > 1 {
+		val := h.valueStack[len(h.valueStack)-1]
+		h.valueStack = h.valueStack[:len(h.valueStack)-1]
+
+		parent := h.valueStack[len(h.valueStack)-1]
+		if parent.Kind() == reflect.Interface && !parent.IsNil() {
+			parent.Set(val)
+		}
+	}
+}
+
+func (h *UnmarshalHandler) OnObjectKey(key string) {
+	h.currentKey = key
+}
+
+func (h *UnmarshalHandler) OnArrayStart() {
+	// Similar to OnObjectStart but for arrays/slices
+	if len(h.valueStack) > 0 {
+		current := h.valueStack[len(h.valueStack)-1]
+		var newVal reflect.Value
+
+		switch current.Kind() {
+		case reflect.Slice:
+			newVal = reflect.MakeSlice(current.Type(), 0, 8)
+		case reflect.Array:
+			newVal = current
+		case reflect.Interface:
+			sliceType := reflect.TypeOf([]interface{}{})
+			newVal = reflect.MakeSlice(sliceType, 0, 8)
+		default:
+			newVal = reflect.Value{}
+		}
+
+		h.valueStack = append(h.valueStack, newVal)
+	} else {
+		h.valueStack = append(h.valueStack, h.target)
+	}
+}
+
+func (h *UnmarshalHandler) OnArrayEnd() {
+	if len(h.valueStack) > 1 {
+		val := h.valueStack[len(h.valueStack)-1]
+		h.valueStack = h.valueStack[:len(h.valueStack)-1]
+
+		parent := h.valueStack[len(h.valueStack)-1]
+		switch parent.Kind() {
+		case reflect.Slice:
+			parent.Set(val)
+		case reflect.Interface:
+			parent.Set(val)
+		}
+	}
+}
+
+func (h *UnmarshalHandler) OnString(value string) {
+	h.setValue(reflect.ValueOf(value))
+}
+
+func (h *UnmarshalHandler) OnNumber(value float64) {
+	h.setValue(reflect.ValueOf(value))
+}
+
+func (h *UnmarshalHandler) OnBool(value bool) {
+	h.setValue(reflect.ValueOf(value))
+}
+
+func (h *UnmarshalHandler) OnNull() {
+	if len(h.valueStack) == 0 {
+		return
+	}
+
+	current := h.valueStack[len(h.valueStack)-1]
+	switch current.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice:
+		if current.CanSet() {
+			current.Set(reflect.Zero(current.Type()))
+		}
+	}
+}
+
+// setValue handles setting values in the current container
+func (h *UnmarshalHandler) setValue(val reflect.Value) {
+	if len(h.valueStack) == 0 {
+		return
+	}
+
+	current := h.valueStack[len(h.valueStack)-1]
+	switch current.Kind() {
+	case reflect.Map:
+		// For maps, set key/value pair
+		keyVal := reflect.ValueOf(h.currentKey)
+		if keyVal.Type() != current.Type().Key() {
+			keyVal = h.convertKey(keyVal, current.Type().Key())
+		}
+
+		valType := current.Type().Elem()
+		convertedVal := h.convertValue(val, valType)
+		current.SetMapIndex(keyVal, convertedVal)
+
+	case reflect.Struct:
+		// For structs, set field by name
+		fields := getCachedFields(current.Type())
+		for _, f := range fields {
+			if string(f.nameBytes) == h.currentKey {
+				field := current.FieldByIndex(f.index)
+				if field.CanSet() {
+					convertedVal := h.convertValue(val, field.Type())
+					field.Set(convertedVal)
+				}
+				break
+			}
+		}
+
+	case reflect.Slice:
+		// For slices, append new value
+		elemType := current.Type().Elem()
+		convertedVal := h.convertValue(val, elemType)
+		newSlice := reflect.Append(current, convertedVal)
+		current.Set(newSlice)
+
+	case reflect.Interface:
+		// For interfaces, set value directly
+		if current.CanSet() {
+			current.Set(val)
+		}
+	}
+}
+
+// Helper methods for type conversion
+func (h *UnmarshalHandler) convertKey(key reflect.Value, keyType reflect.Type) reflect.Value {
+	// Simplified conversion logic
+	if key.Type().ConvertibleTo(keyType) {
+		return key.Convert(keyType)
+	}
+	return reflect.Zero(keyType)
+}
+
+func (h *UnmarshalHandler) convertValue(val reflect.Value, targetType reflect.Type) reflect.Value {
+	// Simplified conversion logic
+	if val.Type().AssignableTo(targetType) {
+		return val
+	}
+	if val.Type().ConvertibleTo(targetType) {
+		return val.Convert(targetType)
+	}
+	return reflect.Zero(targetType)
+}
+
+// IsCapturing returns true if currently capturing JSON content
+func (b *BufferCapture) IsCapturing() bool {
+	return b.capturing
+}
+
+// CaptureKey adds a JSON key to the buffer
+func (b *BufferCapture) CaptureKey(key string) {
+	b.buffer.WriteByte('"')
+	writeEscapedStringString(b.buffer, key)
+	b.buffer.WriteByte('"')
+	b.buffer.WriteByte(':')
+}
+
+// StartCapture begins capturing JSON content
+func (b *BufferCapture) StartCapture(char byte) {
+	b.capturing = true
+	b.buffer.WriteByte(char)
 }

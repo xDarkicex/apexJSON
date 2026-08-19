@@ -232,49 +232,6 @@ func (n Number) Format(format string) string {
 	}
 }
 
-// setNull sets a reflect.Value to its zero value
-func setNull(v reflect.Value) error {
-	switch v.Kind() {
-	case reflect.Interface, reflect.Ptr, reflect.Map, reflect.Slice:
-		v.Set(reflect.Zero(v.Type()))
-		return nil
-	}
-
-	return &UnmarshalTypeError{Value: "null", Type: v.Type()}
-}
-
-// setBool sets a reflect.Value to a boolean
-func setBool(v reflect.Value, b bool) error {
-	switch v.Kind() {
-	case reflect.Bool:
-		v.SetBool(b)
-		return nil
-	case reflect.Interface:
-		if v.NumMethod() == 0 {
-			v.Set(reflect.ValueOf(b))
-			return nil
-		}
-	}
-
-	return &UnmarshalTypeError{Value: "bool", Type: v.Type()}
-}
-
-// setString sets a reflect.Value to a string
-func setString(v reflect.Value, s string) error {
-	switch v.Kind() {
-	case reflect.String:
-		v.SetString(s)
-		return nil
-	case reflect.Interface:
-		if v.NumMethod() == 0 {
-			v.Set(reflect.ValueOf(s))
-			return nil
-		}
-	}
-
-	return &UnmarshalTypeError{Value: "string", Type: v.Type()}
-}
-
 func writeEscapedString(w io.Writer, s []byte) {
 	// Fast path for Buffer type - direct writing without interface calls
 	if buf, ok := w.(*Buffer); ok {
@@ -366,169 +323,6 @@ func needsEscaping(s string) bool {
 	return false
 }
 
-func setNumber(v reflect.Value, s string, decoder *Decoder) error {
-	b := getBuilder()   // Get builder from pool
-	defer putBuilder(b) // Return to pool when done
-
-	// Helper function for type errors
-	makeTypeError := func(s string, v reflect.Value, unsupported ...bool) *UnmarshalTypeError {
-		b.WriteString("number")
-
-		// Check if this is the "unsupported type" case
-		if len(unsupported) > 0 && unsupported[0] {
-			b.WriteString(" (unsupported type)")
-		} else {
-			b.WriteString(" ")
-			b.WriteString(s)
-		}
-
-		return &UnmarshalTypeError{Value: b.String(), Type: v.Type()}
-	}
-
-	if v.Type().Name() == "Number" {
-		v.SetString(s)
-		return nil
-	} else if v.Kind() == reflect.Interface && v.NumMethod() == 0 {
-		// Use Number type if useNumber is enabled, otherwise use float64
-		if decoder != nil && decoder.useNumber {
-			v.Set(reflect.ValueOf(Number(s)))
-			return nil
-		} else {
-			// Try float64 first for all numbers (standard behavior)
-			if n, err := strconv.ParseFloat(s, 64); err == nil {
-				v.Set(reflect.ValueOf(n))
-				return nil
-			}
-		}
-	}
-
-	// Regular type handling
-	switch v.Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		// Fast path for small integers (avoids allocation in strconv.ParseInt)
-		if len(s) < 10 && v.Kind() == reflect.Int64 || v.Kind() == reflect.Int {
-			var n int64
-			var neg bool
-
-			// Check for negative sign
-			i := 0
-			if len(s) > 0 && s[0] == '-' {
-				neg = true
-				i++
-			}
-
-			// Manual parsing of digits
-			for ; i < len(s); i++ {
-				if s[i] < '0' || s[i] > '9' {
-					// Not a simple integer, fall back to standard parsing
-					goto standardIntParse
-				}
-				digit := int64(s[i] - '0')
-
-				// Check for overflow: n*10 + digit > MaxInt64
-				if n > (math.MaxInt64-digit)/10 {
-					// Would overflow, fall back to standard parsing
-					goto standardIntParse
-				}
-
-				n = n*10 + digit
-			}
-
-			// Apply sign
-			if neg {
-				n = -n
-			}
-
-			// Check type overflow
-			if v.OverflowInt(n) {
-				return makeTypeError(s, v)
-			}
-
-			v.SetInt(n)
-			return nil
-		}
-
-	standardIntParse:
-		n, err := strconv.ParseInt(s, 10, 64)
-		if err != nil {
-			return makeTypeError(s, v)
-		}
-		if v.OverflowInt(n) {
-			return makeTypeError(s, v)
-		}
-		v.SetInt(n)
-		return nil
-
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		// Fast path for small unsigned integers
-		if len(s) < 10 && v.Kind() == reflect.Uint64 || v.Kind() == reflect.Uint {
-			var n uint64
-
-			// Manual parsing of digits
-			for i := 0; i < len(s); i++ {
-				if s[i] < '0' || s[i] > '9' {
-					// Not a simple integer, fall back to standard parsing
-					goto standardUintParse
-				}
-				digit := uint64(s[i] - '0')
-
-				// Check for overflow: n*10 + digit > MaxUint64
-				if n > (math.MaxUint64-digit)/10 {
-					// Would overflow, fall back to standard parsing
-					goto standardUintParse
-				}
-
-				n = n*10 + digit
-			}
-
-			// Check type overflow
-			if v.OverflowUint(n) {
-				return makeTypeError(s, v)
-			}
-
-			v.SetUint(n)
-			return nil
-		}
-
-	standardUintParse:
-		n, err := strconv.ParseUint(s, 10, 64)
-		if err != nil {
-			return makeTypeError(s, v)
-		}
-		if v.OverflowUint(n) {
-			return makeTypeError(s, v)
-		}
-		v.SetUint(n)
-		return nil
-
-	case reflect.Float32, reflect.Float64:
-		n, err := strconv.ParseFloat(s, v.Type().Bits())
-		if err != nil {
-			return makeTypeError(s, v)
-		}
-		if v.OverflowFloat(n) {
-			return makeTypeError(s, v)
-		}
-		v.SetFloat(n)
-		return nil
-
-	case reflect.Interface:
-		if v.NumMethod() == 0 {
-			// Try float64 first for all numbers (standard behavior)
-			if n, err := strconv.ParseFloat(s, 64); err == nil {
-				v.Set(reflect.ValueOf(n))
-				return nil
-			}
-		}
-
-		// Just "number" for general type error
-		return makeTypeError(s, v)
-	}
-
-	// Unsupported type
-	return makeTypeError(s, v, true)
-}
-
 // isDigit returns true if c is an ASCII digit
 func isDigit(c byte) bool {
 	return c >= '0' && c <= '9'
@@ -537,36 +331,6 @@ func isDigit(c byte) bool {
 // GetString converts a byte slice to a string without allocation
 func GetString(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
-}
-
-// estimateKeySize provides a rough size estimate for a key (used for pre-allocation)
-func estimateKeySize(key reflect.Value) int {
-	switch key.Kind() {
-	case reflect.String:
-		return len(key.String()) + 2 // Quotes + content
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return 12 // Rough max for int64
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return 12 // Rough max for uint64
-	case reflect.Float32, reflect.Float64:
-		return 16 // Rough max for float64
-	case reflect.Bool:
-		return 5 // "true" or "false"
-	case reflect.Array, reflect.Slice:
-		if key.Type().Elem().Kind() == reflect.Uint8 {
-			return 2 + (key.Len() * 2) // "0x" + hex bytes
-		}
-		return 8 // "empty" or "array"
-	case reflect.Struct:
-		if key.Type().String() == "time.Time" {
-			return len(time.RFC3339)
-		}
-		return 16 // Rough estimate for structs
-	case reflect.Map:
-		return 10 // Rough estimate for "map[n]"
-	default:
-		return 16 // Conservative default
-	}
 }
 
 // estimateValueSize provides a rough size estimate for a value (used for pre-allocation)
@@ -662,85 +426,22 @@ func isWhitespace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
-// Check if a literal is complete
-func isCompleteLiteral(s string) bool {
-	if len(s) > 0 && (s[0] == '{' || s[0] == '[') {
-		return false
-	}
-	// Check for null, true, false
-	if s == "null" || s == "true" || s == "false" {
-		return true
+func (e *InvalidUnmarshalError) Error() string {
+	if e.Type == nil {
+		return "json: Unmarshal(nil)"
 	}
 
-	// Number validation
-	if len(s) == 0 {
-		return false
+	if e.Type.Kind() != reflect.Ptr {
+		return "json: Unmarshal(non-pointer " + e.Type.String() + ")"
 	}
+	return "json: Unmarshal(nil " + e.Type.String() + ")"
+}
 
-	// Check if it's a properly formatted number
-	i := 0
-
-	// Handle negative sign
-	if s[i] == '-' {
-		i++
-		if i >= len(s) {
-			return false // Just a minus sign
-		}
+// SafeString creates a completely independent copy of a string
+// to prevent memory corruption from shared string references
+func SafeString(s string) string {
+	if s == "" {
+		return ""
 	}
-
-	// First digit
-	if s[i] == '0' {
-		i++
-		// After 0, we can only have decimal point or exponent
-	} else if s[i] >= '1' && s[i] <= '9' {
-		i++
-		// Consume additional digits
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			i++
-		}
-	} else {
-		return false // Not a valid start to a number
-	}
-
-	// Decimal part
-	if i < len(s) && s[i] == '.' {
-		i++
-		// Need at least one digit after decimal
-		if i >= len(s) || s[i] < '0' || s[i] > '9' {
-			return false
-		}
-		// Consume fractional digits
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			i++
-		}
-	}
-
-	// Exponent part
-	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
-		i++
-		if i >= len(s) {
-			return false // Nothing after exponent marker
-		}
-
-		// Optional sign
-		if s[i] == '+' || s[i] == '-' {
-			i++
-			if i >= len(s) {
-				return false // Nothing after exponent sign
-			}
-		}
-
-		// Need at least one digit in exponent
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-
-		// Consume exponent digits
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			i++
-		}
-	}
-
-	// We should have consumed the entire string for a valid number
-	return i == len(s)
+	return string([]byte(s))
 }
