@@ -38,15 +38,15 @@ type mutationPathTarget struct {
 // jsonb_set rule that only the final missing component may be created when
 // createMissing is true; missing intermediate components are no-ops.
 func (d *Decoder) SetPathRaw(path []string, replacement []byte, createMissing bool) (bool, error) {
-	if err := validateMutationReplacement(replacement); err != nil {
-		return false, err
-	}
 	target, err := d.resolveMutationPath(path)
 	if err != nil {
 		return false, err
 	}
 	switch target.state {
 	case mutationPathNoop:
+		if err := validateMutationReplacement(replacement); err != nil {
+			return false, err
+		}
 		return false, nil
 	case mutationPathFound:
 		start, end, ok := rawSpanAt(&d.doc, target.idx)
@@ -64,6 +64,9 @@ func (d *Decoder) SetPathRaw(path []string, replacement []byte, createMissing bo
 		return true, nil
 	case mutationPathMissingFinal:
 		if !createMissing {
+			if err := validateMutationReplacement(replacement); err != nil {
+				return false, err
+			}
 			return false, nil
 		}
 		return d.createMissingPathValue(target, replacement)
@@ -78,10 +81,10 @@ func (d *Decoder) SetPathRaw(path []string, replacement []byte, createMissing bo
 // PostgreSQL behavior of prepending for negative indexes and appending for
 // positive indexes.
 func (d *Decoder) InsertPathRaw(path []string, replacement []byte, insertAfter bool) (bool, error) {
-	if err := validateMutationReplacement(replacement); err != nil {
-		return false, err
-	}
 	if len(path) == 0 {
+		if err := validateMutationReplacement(replacement); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	target, err := d.resolveMutationPath(path)
@@ -90,11 +93,17 @@ func (d *Decoder) InsertPathRaw(path []string, replacement []byte, insertAfter b
 	}
 	switch target.state {
 	case mutationPathNoop:
+		if err := validateMutationReplacement(replacement); err != nil {
+			return false, err
+		}
 		return false, nil
 	case mutationPathFound:
 		switch target.parentKind {
 		case nodeObject:
 			// jsonb_insert does not overwrite an existing object key.
+			if err := validateMutationReplacement(replacement); err != nil {
+				return false, err
+			}
 			return false, nil
 		case nodeArray:
 			return d.insertAroundArrayValue(target, replacement, insertAfter)

@@ -144,6 +144,11 @@ func (d *Decoder) Free() {
 	d.root = noNode
 	d.doc.slab.reset()
 	d.doc.releaseOwnedSource()
+	if d.doc.sourceScratch != nil {
+		d.doc.sourceScratch.Free()
+		d.doc.sourceScratch = nil
+		d.doc.sourceScratchCap = 0
+	}
 	if d.arena != nil {
 		d.arena.Free()
 		d.arena = nil

@@ -228,11 +228,12 @@ func (d *parsedDoc) ensureOwnedSource() error {
 	if capacity < 64 {
 		capacity = 64
 	}
-	arena, owned, err := cloneSourceWithCapacity(d.src, capacity)
+	arena, owned, arenaCap, err := d.cloneSourceWithCapacity(d.src, capacity)
 	if err != nil {
 		return err
 	}
 	d.ownedSource = arena
+	d.ownedSourceCap = arenaCap
 	d.src = owned
 	return nil
 }
@@ -249,7 +250,7 @@ func (d *parsedDoc) replaceSpan(start, end int, replacement []byte) (int32, erro
 	if capacity < 64 {
 		capacity = 64
 	}
-	arena, candidate, err := cloneSourceWithCapacity(old, capacity)
+	arena, candidate, arenaCap, err := d.cloneSourceWithCapacity(old, capacity)
 	if err != nil {
 		return noNode, err
 	}
@@ -257,7 +258,7 @@ func (d *parsedDoc) replaceSpan(start, end int, replacement []byte) (int32, erro
 	candidate = candidate[:newLen:newLen]
 	copy(candidate[start+len(replacement):], old[end:])
 	copy(candidate[start:], replacement)
-	return d.commitCandidate(arena, candidate)
+	return d.commitCandidate(arena, arenaCap, candidate)
 }
 
 func (d *parsedDoc) mutateSpan(start, end int, fn func(unsafe.Pointer, int)) (int32, error) {
@@ -265,36 +266,51 @@ func (d *parsedDoc) mutateSpan(start, end int, fn func(unsafe.Pointer, int)) (in
 	if start < 0 || end < start || end > len(old) {
 		return noNode, ErrStaleValue
 	}
-	arena, candidate, err := cloneSourceWithCapacity(old, len(old))
+	arena, candidate, arenaCap, err := d.cloneSourceWithCapacity(old, len(old))
 	if err != nil {
 		return noNode, err
 	}
 	fn(unsafe.Pointer(unsafe.SliceData(candidate[start:end])), end-start)
-	return d.commitCandidate(arena, candidate)
+	return d.commitCandidate(arena, arenaCap, candidate)
 }
 
-func cloneSourceWithCapacity(src []byte, capacity int) (*memory.Arena, []byte, error) {
+func (d *parsedDoc) cloneSourceWithCapacity(src []byte, capacity int) (*memory.Arena, []byte, int, error) {
 	if capacity < len(src) {
 		capacity = len(src)
 	}
 	if capacity < 64 {
 		capacity = 64
 	}
-	arena, err := memory.NewArena(uint64(capacity), 64)
-	if err != nil {
-		return nil, nil, err
+	arena := d.sourceScratch
+	arenaCap := d.sourceScratchCap
+	if arena != nil && arenaCap < capacity {
+		_ = arena.Free()
+		arena = nil
+		arenaCap = 0
 	}
-	ptr, err := arena.Alloc(uint64(capacity))
+	if arena == nil {
+		var err error
+		arena, err = memory.NewArena(uint64(capacity), 64)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		arenaCap = capacity
+	} else {
+		arena.Reset()
+	}
+	d.sourceScratch = nil
+	d.sourceScratchCap = 0
+	ptr, err := arena.Alloc(uint64(arenaCap))
 	if err != nil {
 		_ = arena.Free()
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	dst := unsafe.Slice((*byte)(ptr), capacity)[:len(src):capacity]
+	dst := unsafe.Slice((*byte)(ptr), arenaCap)[:len(src):arenaCap]
 	copy(dst, src)
-	return arena, dst, nil
+	return arena, dst, arenaCap, nil
 }
 
-func (d *parsedDoc) commitCandidate(candidateArena *memory.Arena, candidate []byte) (int32, error) {
+func (d *parsedDoc) commitCandidate(candidateArena *memory.Arena, candidateCap int, candidate []byte) (int32, error) {
 	oldSrc := d.src
 	oldRoot := d.root
 	idx, err := d.parseSource(candidate)
@@ -306,7 +322,8 @@ func (d *parsedDoc) commitCandidate(candidateArena *memory.Arena, candidate []by
 			d.root = oldRoot
 			_ = restoreIdx
 		}
-		_ = candidateArena.Free()
+		d.sourceScratch = candidateArena
+		d.sourceScratchCap = candidateCap
 		if restoreErr != nil {
 			return noNode, ErrInvalidMutation
 		}
@@ -314,12 +331,18 @@ func (d *parsedDoc) commitCandidate(candidateArena *memory.Arena, candidate []by
 	}
 
 	oldArena := d.ownedSource
+	oldArenaCap := d.ownedSourceCap
 	d.ownedSource = candidateArena
+	d.ownedSourceCap = candidateCap
 	d.src = candidate
 	d.root = idx
 	d.generation++
 	if oldArena != nil {
-		_ = oldArena.Free()
+		if d.sourceScratch != nil && d.sourceScratch != oldArena {
+			_ = d.sourceScratch.Free()
+		}
+		d.sourceScratch = oldArena
+		d.sourceScratchCap = oldArenaCap
 	}
 	return idx, nil
 }

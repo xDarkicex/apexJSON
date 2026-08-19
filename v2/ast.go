@@ -214,15 +214,23 @@ type parsedDoc struct {
 	// the source arena separate from the tape arena is important: Decoder.Parse
 	// resets the tape arena on every document, while a mutated source must stay
 	// alive until the next parse or Free.
-	generation  uint64
-	ownedSource *memory.Arena
-	depth       int // parser bookkeeping retained for parser compatibility
+	generation       uint64
+	ownedSource      *memory.Arena
+	ownedSourceCap   int
+	sourceScratch    *memory.Arena
+	sourceScratchCap int
+	depth            int // parser bookkeeping retained for parser compatibility
 }
 
 func (d *parsedDoc) releaseOwnedSource() {
 	if d == nil || d.ownedSource == nil {
 		return
 	}
-	_ = d.ownedSource.Free()
+	if d.sourceScratch != nil && d.sourceScratch != d.ownedSource {
+		_ = d.sourceScratch.Free()
+	}
+	d.sourceScratch = d.ownedSource
+	d.sourceScratchCap = d.ownedSourceCap
 	d.ownedSource = nil
+	d.ownedSourceCap = 0
 }
