@@ -8,6 +8,12 @@ The current engine lives in the v2 module:
 github.com/xDarkicex/apexJSON/v2
 ```
 
+> **v1 is 100% deprecated.** The root `github.com/xDarkicex/apexJSON`
+> package is retained only as historical code. It receives no new features or
+> performance work. Use `github.com/xDarkicex/apexJSON/v2` for the native
+> engine, or `github.com/xDarkicex/apexJSON/v2/compat` for an
+> `encoding/json`-shaped migration surface.
+
 For an `encoding/json`-shaped migration surface, use the compatibility
 facade:
 
