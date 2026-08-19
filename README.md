@@ -99,6 +99,28 @@ func main() {
 
 The direct path supports scalar fields, strings, structs, pointers, arrays, and slices. Unsupported or custom-marshaler-heavy destinations fall back to the complete tape-backed decoder so correctness behavior is preserved.
 
+### Native zero-copy raw JSON
+
+The native package provides `apexjson.RawMessage` for trusted embedded JSON:
+
+```go
+var payload apexjson.RawMessage
+if err := apexjson.Unmarshal(src, &payload); err != nil {
+	panic(err)
+}
+
+dst, err := apexjson.AppendMarshalPtr(dst[:0], &payload)
+```
+
+`RawMessage` borrows the validated input span on unmarshal and appends that
+span directly on marshal. With a reusable destination capacity, these paths
+are zero-allocation. Keep the source buffer alive and immutable while the raw
+message is in use; call `payload.Clone()` when an owned copy is required.
+
+This is intentionally different from plain `[]byte`, which retains JSON's
+binary-data convention and encodes as a base64 string. The compatibility
+package keeps `encoding/json.RawMessage` semantics for migration callers.
+
 ### Off-heap reusable tape
 
 `Decoder` parses into an arena-backed structure-of-arrays tape. The logical node metadata is stored in dense columns:

@@ -46,6 +46,9 @@ func Unmarshal(data []byte, v any) error {
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		return &ErrTypeMismatch{SrcKind: "value", DstType: fmt.Sprintf("%T", v)}
 	}
+	if rv.Elem().Type() == rawMessageType {
+		return unmarshalRawMessage(data, (*RawMessage)(unsafe.Pointer(rv.Elem().UnsafeAddr())))
+	}
 	if directTypeSupported(rv.Elem().Type(), 0) {
 		return unmarshalDirect(data, rv.Elem())
 	}
@@ -61,6 +64,33 @@ func Unmarshal(data []byte, v any) error {
 	err := decodeValue(&dec.doc, root.idx, dec.src, rv.Elem())
 	decoderPool.Put(dec)
 	return err
+}
+
+// unmarshalRawMessage validates one complete JSON document with the
+// allocation-free scanner and then borrows the caller's bytes. This avoids
+// building a tape for a destination that only needs the raw span.
+func unmarshalRawMessage(data []byte, dst *RawMessage) error {
+	valueStart := 0
+	for valueStart < len(data) && isWS(data[valueStart]) {
+		valueStart++
+	}
+	var d directDecoder
+	d.src = data
+	d.scan.reset(data)
+	tok, err := d.nextValueToken()
+	if err != nil {
+		return err
+	}
+	if err := d.skipFromToken(tok, 0); err != nil {
+		return err
+	}
+	valueEnd := d.scan.pos
+	tail, more := d.scan.next()
+	if more || tail.Kind == kindError {
+		return directSyntaxError(tail, "unexpected "+tail.Kind.String())
+	}
+	*dst = RawMessage(data[valueStart:valueEnd])
+	return nil
 }
 
 // decoderPool keeps parsedDoc/arena state alive across Unmarshal calls.
@@ -825,6 +855,7 @@ type typeInfo struct {
 	typ                   reflect.Type
 	typePtr               unsafe.Pointer
 	kind                  reflect.Kind
+	isRawMessage          bool
 	fields                []fieldInfo
 	hasOmitEmpty          bool
 	flatPrimitive         bool // plain scalar/string struct marshal fast path
@@ -1004,6 +1035,7 @@ func buildTypeInfo(t reflect.Type) *typeInfo {
 		typ:                t,
 		typePtr:            typePtrFromReflectType(t),
 		kind:               t.Kind(),
+		isRawMessage:       t == rawMessageType,
 		hasMarshaler:       t.Implements(marshalerType),
 		hasTextMarshal:     t.Implements(textMarshalerType),
 		hasUnmarshaler:     t.Implements(unmarshalerType),

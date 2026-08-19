@@ -260,6 +260,9 @@ func encodeAny(v any, buf *[]byte) error {
 	if ti == nil {
 		ti = getTypeInfo(reflect.TypeOf(v))
 	}
+	if ti.isRawMessage {
+		return appendRawMessage(words[1], buf)
+	}
 	// A top-level value in an interface is not addressable, so pointer
 	// receiver methods must not be synthesized here. Value receiver
 	// marshalers still require Interface() and therefore use the fallback.
@@ -303,6 +306,9 @@ func encodeRaw(dataPtr unsafe.Pointer, ti *typeInfo, buf *[]byte) error {
 	if ti == nil {
 		*buf = append(*buf, "null"...)
 		return nil
+	}
+	if ti.isRawMessage {
+		return appendRawMessage(dataPtr, buf)
 	}
 	switch ti.kind {
 	case reflect.Bool:
@@ -377,6 +383,9 @@ func encodeRaw(dataPtr unsafe.Pointer, ti *typeInfo, buf *[]byte) error {
 }
 
 func encodeRawAddressable(dataPtr unsafe.Pointer, ti *typeInfo, buf *[]byte) error {
+	if ti != nil && ti.isRawMessage {
+		return appendRawMessage(dataPtr, buf)
+	}
 	if ti != nil && (ti.hasMarshaler || ti.hasTextMarshal || ti.hasPtrMarshaler || ti.hasPtrTextMarshal) {
 		return encodeAddressed(ti.typ, dataPtr, buf)
 	}
@@ -1158,6 +1167,9 @@ func encodeValue(rv reflect.Value, buf *[]byte) error {
 	if ti == nil {
 		ti = getTypeInfo(rv.Type())
 	}
+	if ti.isRawMessage {
+		return appendRawMessage(valueDataPtr(rv), buf)
+	}
 	if ti.hasMarshaler && rv.CanInterface() {
 		return encodeMarshaler(rv, buf)
 	}
@@ -1188,6 +1200,18 @@ func encodeValue(rv reflect.Value, buf *[]byte) error {
 		return nil
 	}
 	return encodeRaw(valueDataPtr(rv), ti, buf)
+}
+
+// appendRawMessage emits a RawMessage directly from its slice header. It is
+// the native zero-allocation marshal path when dst has enough capacity.
+func appendRawMessage(dataPtr unsafe.Pointer, buf *[]byte) error {
+	m := *(*RawMessage)(dataPtr)
+	if m == nil {
+		*buf = append(*buf, "null"...)
+		return nil
+	}
+	*buf = append(*buf, m...)
+	return nil
 }
 
 // --- Marshaler interfaces --------------------------------------------------
