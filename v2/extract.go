@@ -128,6 +128,21 @@ func (v Value) Bytes() []byte {
 	return src[v.slab.start(v.idx):v.slab.end(v.idx)]
 }
 
+// RawJSON returns the complete borrowed JSON span for this value. String
+// values include their quotes; containers include their delimiters. The
+// returned slice aliases the decoder's source and becomes invalid after
+// Parse, Reset, Free, or any mutation that reparses the document.
+func (v Value) RawJSON() []byte {
+	if v.owner != nil && v.epoch != v.owner.generation {
+		return nil
+	}
+	start, end, ok := v.rawSpan()
+	if !ok {
+		return nil
+	}
+	return v.source()[start:end]
+}
+
 // Int parses the number as int64. Returns 0 on failure.
 func (v Value) Int() int64 {
 	n, _ := parseIntBytes(v.Bytes(), 64)

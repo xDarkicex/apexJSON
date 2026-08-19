@@ -223,6 +223,59 @@ err := count.MutateUnsafe(func(ptr unsafe.Pointer, n int) {
 
 `MutateBytes` provides the same temporary alias as a byte slice. The alias is valid only during the callback. Invalid candidates are rejected without corrupting the live document, and old `Value` handles are invalidated after reparses or variable-size mutations.
 
+### Native path mutation
+
+The reusable decoder also supports path-aware mutation without materializing a
+Go object tree:
+
+```go
+path := []string{"profile", "login_count"}
+changed, err := dec.SetPathRaw(path, []byte(`42`), true)
+if err != nil {
+	panic(err)
+}
+_ = changed
+
+changed, err = dec.InsertPathRaw(
+		[]string{"items", "1"},
+		[]byte(`{"id":3}`),
+		false, // insert before array element 1
+)
+if err != nil {
+	panic(err)
+}
+```
+
+`SetPathRaw` replaces an existing value and, when requested, creates only a
+missing final object key. Missing intermediate paths are valid no-ops. Array
+indexes support zero-based, negative, and out-of-range PostgreSQL-compatible
+behavior: positive out-of-range creation appends and negative out-of-range
+creation prepends. `InsertPathRaw` inserts before or after an array element;
+existing object keys are valid no-ops. An empty `SetPathRaw` path replaces the
+root; an empty `InsertPathRaw` path is a valid no-op.
+
+Both methods require `replacement` to contain exactly one valid JSON value.
+They build a candidate in off-heap storage, validate it through the native
+tape parser, and publish it only after parsing succeeds. The caller's input
+and replacement slices are never modified. Failed mutations leave the live
+document and existing `Value` handles unchanged; successful path mutations
+reparse the document and make previously acquired handles stale. Reacquire
+values from `Root()` or `GetPath()` after a successful mutation.
+
+`Value.RawJSON()` returns the complete borrowed JSON span, including quotes for
+strings and delimiters for objects and arrays:
+
+```go
+raw := dec.Get("payload").RawJSON()
+```
+
+`RawJSON` does not allocate or materialize a tree. Its slice aliases decoder
+source storage and is invalid after `Parse`, `Reset`, `Free`, or any mutation
+that reparses the document. Keep the input buffer alive for borrowed values.
+
+All decoder mutation APIs follow the same concurrency rule as parsing: a
+single `Decoder` must not be used concurrently; use one decoder per goroutine.
+
 ## Marshal paths
 
 ApexJSON caches type metadata, JSON key prefixes, field offsets, and operation classifications. Struct fields are read through unsafe offsets rather than repeated `reflect.Value.Field` operations.

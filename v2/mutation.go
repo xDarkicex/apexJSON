@@ -42,17 +42,7 @@ func (v Value) rawSpan() (int, int, bool) {
 	if !v.validForMutation() {
 		return 0, 0, false
 	}
-	start := int(v.slab.start(v.idx))
-	end := int(v.slab.end(v.idx))
-	if v.slab.kind(v.idx) == nodeString {
-		start--
-		end++
-	}
-	src := v.source()
-	if start < 0 || end < start || end > len(src) {
-		return 0, 0, false
-	}
-	return start, end, true
+	return rawSpanAt(&parsedDoc{slab: *v.slab, src: v.source()}, v.idx)
 }
 
 // SetRaw replaces this value with one complete JSON value. The source is
