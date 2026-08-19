@@ -67,6 +67,157 @@ func TestDecoderReuse(t *testing.T) {
 	}
 }
 
+func TestDecoderReset(t *testing.T) {
+	dec, err := NewDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Free()
+
+	if err := dec.Parse([]byte(`{"a":{"b":1}}`)); err != nil {
+		t.Fatal(err)
+	}
+	old := dec.Get("a", "b")
+	if !old.Exists() {
+		t.Fatal("expected value before reset")
+	}
+	oldRoot := dec.Root()
+	arena := dec.arena
+	meta := dec.doc.slab.metaBase
+	starts := dec.doc.slab.startBase
+	ends := dec.doc.slab.endBase
+	skips := dec.doc.slab.skipBase
+	metaCap := cap(dec.doc.slab.meta)
+	startsCap := cap(dec.doc.slab.starts)
+	endsCap := cap(dec.doc.slab.ends)
+	skipsCap := cap(dec.doc.slab.skips)
+
+	dec.Reset()
+	if old.Exists() {
+		t.Fatal("value remained valid after reset")
+	}
+	if old.Type() != TypeNull || old.Bytes() != nil || old.Str() != "" {
+		t.Fatal("stale value remained readable after reset")
+	}
+	if oldRoot.Exists() {
+		t.Fatal("old root remained valid after reset")
+	}
+	if dec.Root().Exists() {
+		t.Fatal("root remained valid after reset")
+	}
+	if dec.src != nil || dec.doc.src != nil {
+		t.Fatal("reset retained source bytes")
+	}
+	if dec.Err() != nil {
+		t.Fatalf("reset retained parse error: %v", dec.Err())
+	}
+	if dec.root != noNode || dec.doc.root != noNode || dec.doc.slab.n != 0 {
+		t.Fatal("reset did not clear decoder state")
+	}
+	if dec.arena != arena {
+		t.Fatal("reset replaced the decoder arena")
+	}
+	if dec.doc.slab.metaBase != meta || dec.doc.slab.startBase != starts ||
+		dec.doc.slab.endBase != ends || dec.doc.slab.skipBase != skips {
+		t.Fatal("reset replaced tape storage")
+	}
+	if cap(dec.doc.slab.meta) != metaCap || cap(dec.doc.slab.starts) != startsCap ||
+		cap(dec.doc.slab.ends) != endsCap || cap(dec.doc.slab.skips) != skipsCap {
+		t.Fatal("reset did not retain tape capacity")
+	}
+
+	if err := dec.Parse([]byte(`{"b":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := dec.Get("b").Int(); got != 2 {
+		t.Fatalf("b = %d, want 2", got)
+	}
+}
+
+func TestDecoderResetReleasesMutationSource(t *testing.T) {
+	dec, err := NewDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Free()
+
+	if err := dec.Parse([]byte(`{"name":"alice","ok":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	name := dec.Get("name")
+	if err := name.SetString("a-longer-name"); err != nil {
+		t.Fatal(err)
+	}
+	if dec.doc.ownedSource == nil {
+		t.Fatal("variable-size mutation did not acquire an owned source arena")
+	}
+	owned := dec.doc.ownedSource
+
+	dec.Reset()
+	if dec.doc.ownedSource != nil {
+		t.Fatal("reset retained mutation-owned source arena")
+	}
+	if dec.src != nil || dec.doc.src != nil {
+		t.Fatal("reset retained mutation-owned source bytes")
+	}
+	if dec.arena == nil || owned == dec.arena {
+		t.Fatal("mutation source unexpectedly shared the decoder tape arena")
+	}
+
+	if err := dec.Parse([]byte(`{"fresh":true}`)); err != nil {
+		t.Fatalf("parse after mutation-source reset: %v", err)
+	}
+	if !dec.Get("fresh").Bool() {
+		t.Fatal("parse after mutation-source reset returned the wrong value")
+	}
+}
+
+func TestDecoderResetClearsError(t *testing.T) {
+	dec, err := NewDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Free()
+
+	if err := dec.Parse([]byte(`{"broken":}`)); err == nil {
+		t.Fatal("expected parse error")
+	}
+	if dec.Err() == nil {
+		t.Fatal("decoder did not retain parse error before reset")
+	}
+	dec.Reset()
+	if dec.Err() != nil {
+		t.Fatalf("reset retained parse error: %v", dec.Err())
+	}
+	if err := dec.Parse([]byte(`{"ok":true}`)); err != nil {
+		t.Fatalf("parse after error reset: %v", err)
+	}
+}
+
+func TestDecoderResetZeroAlloc(t *testing.T) {
+	dec, err := NewDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Free()
+
+	if err := dec.Parse([]byte(`{"name":"alice"}`)); err != nil {
+		t.Fatal(err)
+	}
+	name := dec.Get("name")
+	if err := name.SetString("a-longer-name"); err != nil {
+		t.Fatal(err)
+	}
+	dec.Reset()
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		dec.Reset()
+	})
+	if allocs != 0 {
+		t.Fatalf("Decoder.Reset allocated %v times per call", allocs)
+	}
+}
+
 func TestDecoderErrors(t *testing.T) {
 	dec, err := NewDecoder()
 	if err != nil {

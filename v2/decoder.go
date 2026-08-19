@@ -112,6 +112,30 @@ func (d *Decoder) Parse(src []byte) error {
 	return nil
 }
 
+// Reset invalidates all Values produced by the decoder, releases any
+// mutation-owned source buffer, and rewinds the existing off-heap arena
+// without parsing a sentinel document. The Decoder remains usable for a
+// subsequent Parse call.
+//
+// Reset is intended for callers that pool decoders. It performs no heap
+// allocation and does not release the decoder's arena.
+func (d *Decoder) Reset() {
+	if d == nil {
+		return
+	}
+	d.doc.generation++
+	d.doc.root = noNode
+	d.root = noNode
+	d.err = nil
+	d.doc.releaseOwnedSource()
+	d.src = nil
+	d.doc.src = nil
+	if d.arena != nil {
+		d.arena.Reset()
+		d.doc.slab.reset()
+	}
+}
+
 // Free releases the arena's mmap'd memory. After Free, the Decoder is
 // unusable.
 func (d *Decoder) Free() {
