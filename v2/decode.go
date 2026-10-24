@@ -42,6 +42,15 @@ func Unmarshal(data []byte, v any) error {
 	if v == nil {
 		return &SyntaxError{Msg: "Unmarshal called with nil target"}
 	}
+	// The dynamic destinations are handled before any reflection: the tape
+	// is built once and the value is materialized natively, so the only
+	// reflect work left is the destination's own type.
+	switch dst := v.(type) {
+	case *map[string]any:
+		return unmarshalStringAnyMap(data, dst)
+	case *any:
+		return unmarshalAnyValue(data, dst)
+	}
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		return &ErrTypeMismatch{SrcKind: "value", DstType: fmt.Sprintf("%T", v)}
@@ -64,6 +73,68 @@ func Unmarshal(data []byte, v any) error {
 	err := decodeValue(&dec.doc, root.idx, dec.src, rv.Elem())
 	decoderPool.Put(dec)
 	return err
+}
+
+// unmarshalStringAnyMap decodes into a map[string]any without reflect.
+//
+// The tape is built by the parser, which has no reflect in it, and the map is
+// materialized by decodeAnyMapReuse, which walks the tape directly. The
+// destination is reached through the concrete pointer, so nothing here needs
+// a reflect.Value.
+func unmarshalStringAnyMap(data []byte, dst *map[string]any) error {
+	dec, err := acquireUnmarshalDecoder(len(data))
+	if err != nil {
+		return err
+	}
+	if err := dec.Parse(data); err != nil {
+		decoderPool.Put(dec)
+		return err
+	}
+	root := dec.Root()
+	n := dec.doc.slab.view(root.idx)
+	if n.Kind == nodeNull {
+		decoderPool.Put(dec)
+		*dst = nil
+		return nil
+	}
+	if n.Kind != nodeObject {
+		decoderPool.Put(dec)
+		return &ErrTypeMismatch{SrcKind: n.Kind.String(), DstType: "map[string]interface {}"}
+	}
+	mp := *dst
+	if mp == nil {
+		// The AST stores object children as key/value pairs. Reserve the
+		// exact pair count so the map does not repeatedly grow while it is
+		// being filled.
+		mp = make(map[string]any, countObjectPairs(&dec.doc, root.idx))
+	}
+	mp, err = decodeAnyMapReuse(&dec.doc, root.idx, dec.src, mp)
+	decoderPool.Put(dec)
+	if err != nil {
+		return err
+	}
+	*dst = mp
+	return nil
+}
+
+// unmarshalAnyValue decodes into an interface destination without reflect.
+func unmarshalAnyValue(data []byte, dst *any) error {
+	dec, err := acquireUnmarshalDecoder(len(data))
+	if err != nil {
+		return err
+	}
+	if err := dec.Parse(data); err != nil {
+		decoderPool.Put(dec)
+		return err
+	}
+	root := dec.Root()
+	value, err := decodeAnyNodeReuse(&dec.doc, root.idx, dec.src, nil)
+	decoderPool.Put(dec)
+	if err != nil {
+		return err
+	}
+	*dst = value
+	return nil
 }
 
 // unmarshalRawMessage validates one complete JSON document with the
@@ -867,6 +938,8 @@ type typeInfo struct {
 	hasTextUnmarshaler    bool // implements encoding.TextUnmarshaler
 	hasPtrUnmarshaler     bool // *T implements json.Unmarshaler
 	hasPtrTextUnmarshaler bool // *T implements encoding.TextUnmarshaler
+	sizeHint              int  // cached capacity estimate, when it depends only on the type
+	hintFromType          bool // sizeHint is valid
 	directSupport         atomic.Uint32
 	fieldByFirst          [256]int32
 	fieldBitmap           []uint16
@@ -1047,6 +1120,12 @@ func buildTypeInfo(t reflect.Type) *typeInfo {
 		ti.hasPtrTextMarshal = pt.Implements(textMarshalerType)
 		ti.hasPtrUnmarshaler = pt.Implements(unmarshalerType)
 		ti.hasPtrTextUnmarshaler = pt.Implements(textUnmarshalerType)
+	}
+	// A struct's capacity estimate depends only on its type, so it is
+	// computed once here rather than walked with reflection on every call.
+	if t.Kind() == reflect.Struct {
+		ti.sizeHint = int(t.Size()) + 16
+		ti.hintFromType = true
 	}
 	if t.Kind() != reflect.Struct {
 		return ti

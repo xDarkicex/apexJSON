@@ -107,11 +107,45 @@ func Marshal(v any) ([]byte, error) {
 // bytes. The 2x element-size heuristic covers ordinary record slices while
 // allowing append to grow for unusually long strings or escaped values.
 func marshalCapacityHint(v any) int {
-	if v == nil {
+	// The JSON shapes are sized from the value itself, with no reflection.
+	switch value := v.(type) {
+	case nil:
 		return 4
+	case string:
+		return clampCapacityHint(len(value)*2 + 2)
+	case map[string]any:
+		return clampCapacityHint(len(value)*48 + 2)
+	case map[string]string:
+		return clampCapacityHint(len(value)*48 + 2)
+	case []any:
+		return clampCapacityHint(len(value)*30 + 2)
+	case []string:
+		return clampCapacityHint(len(value)*30 + 2)
+	case bool, int, int32, int64, uint, uint32, uint64, float32, float64:
+		return 64
+	}
+	// The remaining shapes resolve their type from the interface header and
+	// take the cached estimate when the type alone determines it. A struct's
+	// estimate is computed once, when its type info is built.
+	words := (*[2]unsafe.Pointer)(unsafe.Pointer(&v))
+	ti := loadTypeInfo(uintptr(words[0]))
+	if ti != nil && ti.hintFromType {
+		return clampCapacityHint(ti.sizeHint)
 	}
 	rv := reflect.ValueOf(v)
 	return marshalTypeCapacityHint(rv.Type(), rv, 0)
+}
+
+// clampCapacityHint bounds a capacity estimate.
+func clampCapacityHint(n int) int {
+	const maxInt = int(^uint(0) >> 1)
+	if n < 64 {
+		return 64
+	}
+	if n > maxInt/2 {
+		return maxInt
+	}
+	return n
 }
 
 func marshalTypeCapacityHint(t reflect.Type, rv reflect.Value, depth int) int {
@@ -119,15 +153,7 @@ func marshalTypeCapacityHint(t reflect.Type, rv reflect.Value, depth int) int {
 		return 1024
 	}
 	const maxInt = int(^uint(0) >> 1)
-	clamp := func(n int) int {
-		if n < 64 {
-			return 64
-		}
-		if n > maxInt/2 {
-			return maxInt
-		}
-		return n
-	}
+	clamp := clampCapacityHint
 	switch t.Kind() {
 	case reflect.String:
 		return clamp(rv.Len()*2 + 2)
@@ -250,6 +276,11 @@ func newMarshalScratch() *marshalScratch {
 // For the typed-struct hot path, encodeStructAddr is called directly
 // from encodeValue, bypassing reflect.Value.Field(i).
 func encodeAny(v any, buf *[]byte) error {
+	// The JSON shapes are encoded without reflect. Everything else falls
+	// through to the interface-header path below.
+	if handled, err := encodeAnyFast(v, buf); handled {
+		return err
+	}
 	if v == nil {
 		*buf = append(*buf, "null"...)
 		return nil
@@ -782,13 +813,27 @@ func typePtrFromReflectType(t reflect.Type) unsafe.Pointer {
 }
 
 const (
-	reflectKindOffset      = 23 // internal/abi.Type.Kind_ on Go 1.25
-	reflectKindDirectIface = 1 << 5
+	reflectKindOffset       = 23 // internal/abi.Type.Kind_ on Go 1.25
+	reflectKindDirectIface  = 1 << 5
+	reflectTFlagOffset      = 20     // internal/abi.Type.TFlag
+	reflectTFlagDirectIface = 1 << 5 // abi.TFlagDirectIface on Go 1.27
 )
 
+// typeIfaceIndir reports whether a value of the given runtime type is stored
+// indirectly in an interface.
+//
+// Go 1.27 moved the direct-interface flag out of the type's kind byte and into
+// its TFlag byte. Reading only the kind byte therefore made every type look
+// indirect on Go 1.27, and the encoder then walked a map's header as though
+// it were the address of a slot holding the map. Bit 5 of TFlag is unused on
+// Go 1.25 and earlier, so consulting both bytes is safe on every supported
+// version.
 func typeIfaceIndir(typePtr unsafe.Pointer) bool {
 	if typePtr == nil {
 		return true
+	}
+	if *(*uint8)(unsafe.Add(typePtr, reflectTFlagOffset))&reflectTFlagDirectIface != 0 {
+		return false
 	}
 	k := *(*uint8)(unsafe.Add(typePtr, reflectKindOffset))
 	return k&reflectKindDirectIface == 0

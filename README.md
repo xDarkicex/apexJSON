@@ -294,6 +294,16 @@ For plain slices of primitive/string structs, the encoder uses a specialized fla
 
 `AppendMarshalPtr` can run with zero allocations when `dst` already has enough capacity. `Marshal` returns an owned byte slice and may allocate the result buffer; zero allocation is not possible when a new result must be returned to the caller.
 
+### The dynamic fast path
+
+A `map[string]any` — the shape a JSON document becomes once it is decoded into `any` — is encoded without reflection. A type switch supplies the concrete type statically, so the map is iterated with Go's native `range` and its values are dispatched through the same cached type table the typed path uses. There is no `reflect.Value`, no `MapKeys`, and no copy of the map's values out one at a time.
+
+The scratch holding the sorted entries lives on the stack for maps of up to sixteen entries, so a document full of small objects allocates nothing per object. Larger maps sort their keys and look the values back up, because a comparison closure over a pointer-bearing slice costs more than the lookups it saves.
+
+The reflect path remains for everything else — named types, custom marshalers, channels and functions. It is the fallback, not the common case.
+
+Decoding has the same shape. The parser builds an off-heap tape with no reflection in it, and `map[string]any` and `any` destinations are materialized by walking that tape directly. A destination of either concrete type is reached through the pointer, so the reflect-free path does not build a `reflect.Value` for it either.
+
 ## Memory and ownership
 
 - AST/tape columns and reusable parser scratch memory are backed by `github.com/xDarkicex/memory` arenas.
@@ -315,6 +325,7 @@ ApexJSON is optimized for different costs through the API the caller already nee
 | Allocation-free traversal | `ObjectIter` / `ArrayIter` | Cursor movement over skip offsets |
 | In-place document edits | `Value.Set*` / `Mutate*` | Off-heap copy-on-write source and reparsed tape |
 | Typed serialization | `Marshal` / `AppendMarshalPtr` | Cached unsafe field plans and flat primitive kernels |
+| Generic maps and interfaces | `Marshal` / `Unmarshal` | Native type-switch dispatch, a stack scratch, and no reflection on the hot path |
 
 There are no public parser modes to configure. The entry point expresses the operation, while the implementation selects the appropriate internal path.
 
@@ -339,6 +350,39 @@ go test -run TestCompareTypedLatency1MiB -v
 ```
 
 When comparing libraries, report the full tuple: GB/s, ns/op, p50, p99, p99.9, B/op, allocs/op, and retained memory. Run competing implementations under the same workload and hardware conditions.
+
+### Measured results
+
+Apple M2, Go 1.27.1, `-benchmem`. The "before" column is the previous release; "after" is this one. Each figure is the minimum of ten interleaved runs of both builds, so the two columns saw the same machine load — on a shared box, single runs are not comparable and the deltas are worth more than the absolutes.
+
+| Workload | | ns/op | GB/s | B/op | allocs/op |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Marshal, small struct | before | 119.4 | 0.503 | 144 | 2 |
+| | **after** | **117.8** | **0.509** | 144 | 2 |
+| Marshal, generic map | before | 1336.0 | — | 1112 | 36 |
+| | **after** | **362.4** | — | **256** | **1** |
+| Marshal, 1 MiB struct array | before | 1084380 | 0.967 | 1048605 | 2 |
+| | **after** | **1046124** | **1.002** | 1048604 | 2 |
+| Marshal, 1 MiB as a generic map | before | 8924191 | — | 11153396 | 229714 |
+| | **after** | **2617354** | — | **5241562** | **30** |
+| Unmarshal into `map[string]any` | before | 480.7 | — | 480 | 9 |
+| | **after** | **429.5** | — | 480 | 9 |
+| Unmarshal into `any` | before | 490.2 | — | 480 | 9 |
+| | **after** | **420.3** | — | 480 | 9 |
+
+The struct path is unchanged because it was already reflection-free: field reads go through cached offsets, not `reflect.Value.Field`. What changed is the dynamic path, which used to pay `reflect.copyVal` for every value in every map.
+
+Against the other engines, on the same runs:
+
+| Workload | ApexJSON | encoding/json | GoJSON | json/v2 |
+| --- | ---: | ---: | ---: | ---: |
+| Marshal, small struct | 117.8 ns | 172.0 ns | 109.4 ns | 289.0 ns |
+| Marshal, generic map | **362.4 ns** | 940.1 ns | 763.4 ns | 898.1 ns |
+| Marshal, 1 MiB as a generic map | **2.62 ms** | 6.18 ms | 4.62 ms | 2.82 ms |
+| Unmarshal into `map[string]any` | **429.5 ns** | 1066.0 ns | 554.0 ns | 805.1 ns |
+| Unmarshal into `any` | **420.3 ns** | 775.9 ns | 563.3 ns | 610.9 ns |
+
+ApexJSON is ahead on every dynamic workload and still behind GoJSON on small structs, where GoJSON's per-type encoder cache edges out the cached field plans.
 
 ## Current scope
 
